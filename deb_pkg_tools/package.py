@@ -1,7 +1,7 @@
 # Debian packaging tools: Package manipulation.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: November 16, 2013
+# Last Change: August 31, 2014
 # URL: https://github.com/xolox/python-deb-pkg-tools
 
 """
@@ -16,21 +16,25 @@ This module provides functions to build and inspect Debian package archives
 import collections
 import fnmatch
 import logging
+import os
 import os.path
 import pipes
 import random
 import re
 import shutil
-import StringIO
 import tempfile
 
 # External dependencies.
 from debian.deb822 import Deb822
-from humanfriendly import format_path, pluralize
+from executor import execute
+from humanfriendly import concatenate, format_path, pluralize, Spinner
 
 # Modules included in our package.
-from deb_pkg_tools.control import patch_control_file
-from deb_pkg_tools.utils import execute
+from deb_pkg_tools.control import (deb822_from_string,
+                                   parse_control_fields,
+                                   patch_control_file)
+from deb_pkg_tools.utils import coerce_boolean
+from deb_pkg_tools.version import Version
 
 # Initialize a logger.
 logger = logging.getLogger(__name__)
@@ -39,7 +43,8 @@ logger = logging.getLogger(__name__)
 DIRECTORIES_TO_REMOVE = ('.bzr', # Bazaar
                          '.git', # Git
                          '.hg',  # Mercurial
-                         '.svn') # SVN
+                         '.svn', # SVN
+                         '__pycache__') # Python 3.x byte code files (http://lintian.debian.org/tags/package-installs-python-pycache-dir.html)
 
 FILES_TO_REMOVE = ('*.pyc',            # Python byte code files (http://lintian.debian.org/tags/package-installs-python-bytecode.html)
                    '*.pyo',            # Python optimized byte code files (http://lintian.debian.org/tags/package-installs-python-bytecode.html)
@@ -55,50 +60,328 @@ FILES_TO_REMOVE = ('*.pyc',            # Python byte code files (http://lintian.
                    '.hgtags',          # Mercurial ignore files (http://lintian.debian.org/tags/package-contains-vcs-control-file.html)
                    '.s??')             # Vim anonymous swap files
 
-def inspect_package(archive):
-    r"""
+def parse_filename(filename):
+    """
+    Parse the filename of a Debian binary package archive into three fields:
+    the name of the package, its version and its architecture. Raises
+    :py:exc:`ValueError` when the given filename cannot be parsed. See also
+    :py:func:`determine_package_archive()`.
+
+    Here's an example:
+
+    >>> from deb_pkg_tools.package import parse_filename
+    >>> components = parse_filename('/var/cache/apt/archives/python2.7_2.7.3-0ubuntu3.4_amd64.deb')
+    >>> print(repr(components))
+    PackageFile(name='python2.7',
+                version='2.7.3-0ubuntu3.4',
+                architecture='amd64',
+                filename='/var/cache/apt/archives/python2.7_2.7.3-0ubuntu3.4_amd64.deb')
+
+    :param filename: The pathname of a ``*.deb`` archive (a string).
+    :returns: A :py:class:`PackageFile` object.
+    """
+    if isinstance(filename, PackageFile):
+        return filename
+    pathname = os.path.abspath(filename)
+    filename = os.path.basename(pathname)
+    basename, extension = os.path.splitext(filename)
+    if extension != '.deb':
+        raise ValueError("Refusing to parse filename that doesn't have `.deb' extension! (%r)" % pathname)
+    components = basename.split('_')
+    if len(components) != 3:
+        raise ValueError("Filename doesn't have three underscore separated components! (%r)" % pathname)
+    return PackageFile(name=components[0],
+                       version=Version(components[1]),
+                       architecture=components[2],
+                       filename=pathname)
+
+class PackageFile(collections.namedtuple('PackageFile', 'name, version, architecture, filename')):
+
+    """
+    The function :py:func:`parse_filename()` reports the fields of a package
+    archive's filename as a :py:class:`PackageFile` object (a named tuple).
+    Here are the fields supported by these named tuples:
+
+    .. py:attribute:: name
+
+       The name of the package (a string).
+
+    .. py:attribute:: version
+
+       The version of the package (a :py:class:`.Version` object).
+
+    .. py:attribute:: architecture
+
+       The architecture of the package (a string).
+
+    .. py:attribute:: filename
+
+       The absolute pathname of the package archive (a string).
+
+    The following fields are generated on demand:
+
+    .. py:attribute:: directory
+
+       The absolute pathname of the directory containing the package archive (a
+       string).
+
+    .. py:attribute:: other_versions
+
+       A list of :py:class:`PackageFile` objects with other versions of the
+       same package in the same directory.
+
+    .. py:attribute: newer_versions
+
+       A list of :py:class:`PackageFile` objects with newer versions of the
+       same package in the same directory.
+
+    :py:class:`PackageFile` objects support sorting according to Debian's
+    package version comparison algorithm as implemented in ``dpkg
+    --compare-versions``.
+    """
+
+    @property
+    def directory(self):
+        return os.path.dirname(self.filename)
+
+    @property
+    def other_versions(self):
+        archives = []
+        for other_archive in find_package_archives(self.directory):
+            if self.name == other_archive.name and self.version != other_archive.version:
+                archives.append(other_archive)
+        return archives
+
+    @property
+    def newer_versions(self):
+        archives = []
+        for other_archive in self.other_versions:
+            if other_archive.version > self.version:
+                archives.append(other_archive)
+        return archives
+
+def find_package_archives(directory):
+    """
+    Find the Debian package archive(s) in the given directory.
+
+    :param directory: The pathname of a directory (a string).
+    :returns: A list of :py:class:`PackageFile` objects.
+    """
+    archives = []
+    for entry in os.listdir(directory):
+        if entry.endswith('.deb'):
+            pathname = os.path.join(directory, entry)
+            if os.path.isfile(pathname):
+                archives.append(parse_filename(pathname))
+    return archives
+
+def collect_related_packages(filename, cache=None):
+    """
+    Collect the package archive(s) related to the given package archive. This
+    works by parsing and resolving the dependencies of the given package to
+    filenames of package archives, then parsing and resolving the dependencies
+    of those package archives, etc. until no more relationships can be resolved
+    to existing package archives.
+
+    :param filename: The filename of an existing ``*.deb`` archive (a string).
+    :param cache: The :py:class:`.PackageCache` to use (defaults to ``None``).
+    :returns: A list of :py:class:`PackageFile` objects.
+
+    This function is used to implement the ``deb-pkg-tools --collect`` command:
+
+    .. code-block:: sh
+
+       $ deb-pkg-tools -c /tmp python-deb-pkg-tools_1.13-1_all.deb
+       2014-05-18 08:33:42 deb_pkg_tools.package INFO Collecting packages related to ~/python-deb-pkg-tools_1.13-1_all.deb ..
+       2014-05-18 08:33:42 deb_pkg_tools.package INFO Scanning ~/python-deb-pkg-tools_1.13-1_all.deb ..
+       2014-05-18 08:33:42 deb_pkg_tools.package INFO Scanning ~/python-coloredlogs_0.4.8-1_all.deb ..
+       2014-05-18 08:33:42 deb_pkg_tools.package INFO Scanning ~/python-chardet_2.2.1-1_all.deb ..
+       2014-05-18 08:33:42 deb_pkg_tools.package INFO Scanning ~/python-humanfriendly_1.7.1-1_all.deb ..
+       2014-05-18 08:33:42 deb_pkg_tools.package INFO Scanning ~/python-debian_0.1.21-1_all.deb ..
+       Found 5 package archives:
+        - ~/python-chardet_2.2.1-1_all.deb
+        - ~/python-coloredlogs_0.4.8-1_all.deb
+        - ~/python-deb-pkg-tools_1.13-1_all.deb
+        - ~/python-humanfriendly_1.7.1-1_all.deb
+        - ~/python-debian_0.1.21-1_all.deb
+       Copy 5 package archives to /tmp? [Y/n] y
+       2014-05-18 08:33:44 deb_pkg_tools.cli INFO Done! Copied 5 package archives to /tmp.
+
+    .. note:: The implementation of this function can be somewhat slow when
+              you're dealing with a lot of packages, but this function is meant
+              to be used interactively so I don't think it will be a big issue.
+    """
+    filename = os.path.abspath(filename)
+    logger.info("Collecting packages related to %s ..", format_path(filename))
+    # Internal state.
+    relationship_sets = set()
+    packages_to_scan = [filename]
+    related_packages = collections.defaultdict(list)
+    # Preparations.
+    available_packages = find_package_archives(os.path.dirname(filename))
+    # Loop to collect the related packages.
+    num_scanned_packages = 0
+    spinner = Spinner(total=len(available_packages) / 2)
+    while packages_to_scan:
+        filename = packages_to_scan.pop(0)
+        logger.debug("Scanning %s ..", format_path(filename))
+        # Find the relationships of the given package.
+        fields = inspect_package_fields(filename, cache)
+        if 'Depends' in fields:
+            relationship_sets.add(fields['Depends'])
+        # Collect all related packages from the given directory.
+        packages_to_skip = []
+        for package in available_packages:
+            package_matches = None
+            for relationships in relationship_sets:
+                status = relationships.matches(package.name, package.version)
+                if status == True and package_matches != False:
+                    package_matches = True
+                elif status == False:
+                    package_matches = False
+                    break
+            if package_matches == True:
+                logger.debug("Package archive matched all relationships: %s", package.filename)
+                related_packages[package.name].append(package)
+                packages_to_scan.append(package.filename)
+                packages_to_skip.append(package)
+            elif package_matches == False:
+                # If we are sure we can exclude a package from all further
+                # iterations, it's worth it to speed up the process on big
+                # dependency sets.
+                packages_to_skip.append(package)
+            spinner.step(label="Collecting related packages", progress=num_scanned_packages)
+        for package in packages_to_skip:
+            available_packages.remove(package)
+        num_scanned_packages += 1
+    spinner.clear()
+    # Pick the latest version of the collected packages.
+    return list(map(find_latest_version, related_packages.values()))
+
+def find_latest_version(packages):
+    """
+    Find the package archive with the highest version number. Uses
+    :py:class:`.Version` objects for version comparison. Raises
+    :py:exc:`ValueError` when not all of the given package archives share the
+    same package name.
+
+    :param packages: A list of filenames (strings) and/or
+                     :py:class:`PackageFile` objects.
+    :returns: The :py:class:`PackageFile` with
+              the highest version number.
+    """
+    packages = sorted(map(parse_filename, packages))
+    names = set(p.name for p in packages)
+    if len(names) > 1:
+        msg = "Refusing to compare unrelated packages! (%s)"
+        raise ValueError(msg % concatenate(sorted(names)))
+    return packages[-1]
+
+def group_by_latest_versions(packages):
+    """
+    Group package archives by name of package and find latest version of each.
+
+    :param packages: A list of filenames (strings) and/or
+                     :py:class:`PackageFile` objects.
+    :returns: A dictionary with package names as keys and
+              :py:class:`PackageFile` objects as values.
+    """
+    grouped_packages = collections.defaultdict(set)
+    for value in packages:
+        package = parse_filename(value)
+        grouped_packages[package.name].add(package)
+    return dict((n, find_latest_version(p)) for n, p in grouped_packages.items())
+
+def inspect_package(archive, cache=None):
+    """
     Get the metadata and contents from a ``*.deb`` archive.
 
     :param archive: The pathname of an existing ``*.deb`` archive.
+    :param cache: The :py:class:`.PackageCache` to use (defaults to ``None``).
     :returns: A tuple with two dictionaries:
 
-              1. A dictionary with control file fields (an instance of
-                 :py:func:`debian.deb822.Deb822`).
-              2. A dictionary with the directories and files contained in the
-                 package. The dictionary keys are the absolute pathnames and
-                 the dictionary values are named tuples with five fields:
-                 permissions, owner, group, size, modified (see the example
-                 below).
+              1. The result of :py:func:`inspect_package_fields()`.
+              2. The result of :py:func:`inspect_package_contents()`.
+    """
+    return (inspect_package_fields(archive, cache),
+            inspect_package_contents(archive, cache))
 
-    To give you an idea of what the result looks like:
+def inspect_package_fields(archive, cache=None):
+    r"""
+    Get the fields (metadata) from a ``*.deb`` archive.
 
-    >>> from deb_pkg_tools.package import inspect_package
-    >>> fields, contents = inspect_package('/var/cache/apt/archives/python2.7_2.7.3-0ubuntu3.4_amd64.deb')
-    >>> print fields
+    :param archive: The pathname of an existing ``*.deb`` archive.
+    :param cache: The :py:class:`.PackageCache` to use (defaults to ``None``).
+    :returns: A dictionary with control file fields (the result of
+              :py:func:`.parse_control_fields()`).
+
+    Here's an example:
+
+    >>> from deb_pkg_tools.package import inspect_package_fields
+    >>> print(repr(inspect_package_fields('python3.4-minimal_3.4.0-1+precise1_amd64.deb')))
     {'Architecture': u'amd64',
-     'Conflicts': u'python-profiler (<= 2.7.1-2)',
-     'Depends': u'python2.7-minimal (= 2.7.3-0ubuntu3.4), mime-support, libbz2-1.0, libc6 (>= 2.15), libdb5.1, libexpat1 (>= 1.95.8), libgcc1 (>= 1:4.1.1), libncursesw5 (>= 5.6+20070908), libreadline6 (>= 6.0), libsqlite3-0 (>= 3.5.9), libtinfo5',
-     'Description': u'Interactive high-level object-oriented language (version 2.7)\n Version 2.7 of the high-level, interactive object oriented language,\n includes an extensive class library with lots of goodies for\n network programming, system administration, sounds and graphics.',
-     'Installed-Size': u'8779',
-     'Maintainer': u'Ubuntu Core Developers <ubuntu-devel-discuss@lists.ubuntu.com>',
+     'Conflicts': RelationshipSet(VersionedRelationship(name=u'binfmt-support', operator=u'<<', version=u'1.1.2')),
+     'Depends': RelationshipSet(VersionedRelationship(name=u'libexpat1', operator=u'>=', version=u'1.95.8'),
+                                VersionedRelationship(name=u'libgcc1', operator=u'>=', version=u'1:4.1.1'),
+                                VersionedRelationship(name=u'libpython3.4-minimal', operator=u'=', version=u'3.4.0-1+precise1'),
+                                VersionedRelationship(name=u'zlib1g', operator=u'>=', version=u'1:1.2.0')),
+     'Description': u'Minimal subset of the Python language (version 3.4)\n This package contains the interpreter and some essential modules.  It can\n be used in the boot process for some basic tasks.\n See /usr/share/doc/python3.4-minimal/README.Debian for a list of the modules\n contained in this package.',
+     'Installed-Size': 3586,
+     'Maintainer': u'Felix Krull <f_krull@gmx.de>',
      'Multi-Arch': u'allowed',
      'Original-Maintainer': u'Matthias Klose <doko@debian.org>',
-     'Package': u'python2.7',
+     'Package': u'python3.4-minimal',
+     'Pre-Depends': u'libc6 (>= 2.15)',
      'Priority': u'optional',
-     'Provides': u'python-argparse, python2.7-argparse, python2.7-celementtree, python2.7-cjkcodecs, python2.7-ctypes, python2.7-elementtree, python2.7-profiler, python2.7-wsgiref',
-     'Replaces': u'python-profiler (<= 2.7.1-2)',
+     'Recommends': u'python3.4',
      'Section': u'python',
-     'Suggests': u'python2.7-doc, binutils',
-     'Version': u'2.7.3-0ubuntu3.4'}
-    >>> print contents
-    {'/usr/lib/python2.7/email/mime/': ArchiveEntry(permissions='drwxr-xr-x', owner='root', group='root', size=0, modified='2013-09-26 22:28'),
-     '/usr/lib/python2.7/encodings/gbk.py': ArchiveEntry(permissions='-rw-r--r--', owner='root', group='root', size=1015, modified='2013-09-26 22:28'),
-     '/usr/lib/python2.7/multiprocessing/managers.py': ArchiveEntry(permissions='-rw-r--r--', owner='root', group='root', size=36586, modified='2013-09-26 22:28'),
-     '/usr/lib/python2.7/sqlite3/dbapi2.py': ArchiveEntry(permissions='-rw-r--r--', owner='root', group='root', size=2615, modified='2013-09-26 22:28'),
-     '/usr/lib/python2.7/uuid.py': ArchiveEntry(permissions='-rw-r--r--', owner='root', group='root', size=21095, modified='2013-09-26 22:28'),
-     ...}
+     'Source': u'python3.4',
+     'Suggests': RelationshipSet(Relationship(name=u'binfmt-support')),
+     'Version': u'3.4.0-1+precise1'}
+
     """
-    metadata = Deb822(StringIO.StringIO(execute('dpkg-deb', '-f', archive, logger=logger, capture=True)))
+    if cache:
+        return cache[archive].control_fields
+    listing = execute('dpkg-deb', '-f', archive, logger=logger, capture=True)
+    raw_control_fields = deb822_from_string(listing)
+    return parse_control_fields(raw_control_fields)
+
+def inspect_package_contents(archive, cache=None):
+    """
+    Get the contents from a ``*.deb`` archive.
+
+    :param archive: The pathname of an existing ``*.deb`` archive.
+    :param cache: The :py:class:`.PackageCache` to use (defaults to ``None``).
+    :returns: A dictionary with the directories and files contained in the
+              package. The dictionary keys are the absolute pathnames and the
+              dictionary values are :py:class:`ArchiveEntry` objects (see the
+              example below).
+
+    An example:
+
+    >>> from deb_pkg_tools.package import inspect_package_contents
+    >>> print(repr(inspect_package_contents('python3.4-minimal_3.4.0-1+precise1_amd64.deb')))
+    {u'/': ArchiveEntry(permissions=u'drwxr-xr-x', owner=u'root', group=u'root', size=0, modified=u'2014-03-20 23:54', target=u''),
+     u'/usr/': ArchiveEntry(permissions=u'drwxr-xr-x', owner=u'root', group=u'root', size=0, modified=u'2014-03-20 23:52', target=u''),
+     u'/usr/bin/': ArchiveEntry(permissions=u'drwxr-xr-x', owner=u'root', group=u'root', size=0, modified=u'2014-03-20 23:54', target=u''),
+     u'/usr/bin/python3.4': ArchiveEntry(permissions=u'-rwxr-xr-x', owner=u'root', group=u'root', size=3536680, modified=u'2014-03-20 23:54', target=u''),
+     u'/usr/bin/python3.4m': ArchiveEntry(permissions=u'hrwxr-xr-x', owner=u'root', group=u'root', size=0, modified=u'2014-03-20 23:54', target=u'/usr/bin/python3.4'),
+     u'/usr/share/': ArchiveEntry(permissions=u'drwxr-xr-x', owner=u'root', group=u'root', size=0, modified=u'2014-03-20 23:53', target=u''),
+     u'/usr/share/binfmts/': ArchiveEntry(permissions=u'drwxr-xr-x', owner=u'root', group=u'root', size=0, modified=u'2014-03-20 23:53', target=u''),
+     u'/usr/share/binfmts/python3.4': ArchiveEntry(permissions=u'-rw-r--r--', owner=u'root', group=u'root', size=72, modified=u'2014-03-20 23:53', target=u''),
+     u'/usr/share/doc/': ArchiveEntry(permissions=u'drwxr-xr-x', owner=u'root', group=u'root', size=0, modified=u'2014-03-20 23:53', target=u''),
+     u'/usr/share/doc/python3.4-minimal/': ArchiveEntry(permissions=u'drwxr-xr-x', owner=u'root', group=u'root', size=0, modified=u'2014-03-20 23:54', target=u''),
+     u'/usr/share/doc/python3.4-minimal/README.Debian': ArchiveEntry(permissions=u'-rw-r--r--', owner=u'root', group=u'root', size=3779, modified=u'2014-03-20 23:52', target=u''),
+     u'/usr/share/doc/python3.4-minimal/changelog.Debian.gz': ArchiveEntry(permissions=u'-rw-r--r--', owner=u'root', group=u'root', size=28528, modified=u'2014-03-20 22:32', target=u''),
+     u'/usr/share/doc/python3.4-minimal/copyright': ArchiveEntry(permissions=u'-rw-r--r--', owner=u'root', group=u'root', size=51835, modified=u'2014-03-20 20:37', target=u''),
+     u'/usr/share/man/': ArchiveEntry(permissions=u'drwxr-xr-x', owner=u'root', group=u'root', size=0, modified=u'2014-03-20 23:52', target=u''),
+     u'/usr/share/man/man1/': ArchiveEntry(permissions=u'drwxr-xr-x', owner=u'root', group=u'root', size=0, modified=u'2014-03-20 23:54', target=u''),
+     u'/usr/share/man/man1/python3.4.1.gz': ArchiveEntry(permissions=u'-rw-r--r--', owner=u'root', group=u'root', size=5340, modified=u'2014-03-20 23:30', target=u''),
+     u'/usr/share/man/man1/python3.4m.1.gz': ArchiveEntry(permissions=u'lrwxrwxrwx', owner=u'root', group=u'root', size=0, modified=u'2014-03-20 23:54', target=u'python3.4.1.gz')}
+
+    """
+    if cache:
+        return cache[archive].contents
     contents = {}
     for line in execute('dpkg-deb', '-c', archive, logger=logger, capture=True).splitlines():
         # Example output of dpkg-deb -c archive.deb:
@@ -111,10 +394,38 @@ def inspect_package(archive):
         modified = fields[3] + ' ' + fields[4]
         pathname = re.sub('^./', '/', fields[5])
         pathname, _, target = pathname.partition(' -> ')
+        if not target:
+            pathname, _, target = pathname.partition(' link to ')
+            target = re.sub('^./', '/', target)
         contents[pathname] = ArchiveEntry(permissions, owner, group, size, modified, target)
-    return metadata, contents
+    return contents
 
-ArchiveEntry = collections.namedtuple('ArchiveEntry', 'permissions, owner, group, size, modified, target')
+class ArchiveEntry(collections.namedtuple('ArchiveEntry', 'permissions, owner, group, size, modified, target')):
+    """
+    The function :py:func:`inspect_package()` reports the contents of package
+    archives as a dictionary containing named tuples. Here are the fields
+    supported by those named tuples:
+
+    .. py:attribute:: permissions
+
+       The entry type and permission bits just like ``ls -l`` prints them (a string like `drwxr-xr-x`).
+
+    .. py:attribute:: owner
+
+       The username of the owner of the entry (a string).
+
+    .. py:attribute:: group
+
+       The group name of group owning the entry (a string).
+
+    .. py:attribute:: size
+
+       The size of the entry in bytes (an integer).
+
+    .. py:attribute:: modified
+
+       A string like ``2013-09-26 22:28``.
+    """
 
 def build_package(directory, repository=None, check_package=True, copy_files=True):
     """
@@ -140,9 +451,9 @@ def build_package(directory, repository=None, check_package=True, copy_files=Tru
        by :py:func:`build_package()`.
 
     If any of the external commands invoked by this function fail,
-    :py:exc:`deb_pkg_tools.utils.ExternalCommandFailed` is raised. If this
-    function returns without raising an exception, the generated Debian package
-    can be found in the parent directory of the directory given as the first
+    :py:exc:`executor.ExternalCommandFailed` is raised. If this function
+    returns without raising an exception, the generated Debian package can be
+    found in the parent directory of the directory given as the first
     argument.
 
     :param directory: The pathname of a directory tree suitable for packaging
@@ -162,34 +473,77 @@ def build_package(directory, repository=None, check_package=True, copy_files=Tru
     .. _Installed-Size: http://www.debian.org/doc/debian-policy/ch-controlfields.html#s-f-Installed-Size
     .. _Lintian: http://lintian.debian.org/
     """
-    build_directory = tempfile.mkdtemp()
-    logger.debug("Created build directory: %s", format_path(build_directory))
     if not repository:
         repository = tempfile.gettempdir()
     package_file = os.path.join(repository, determine_package_archive(directory))
     logger.debug("Preparing to build package: %s", format_path(package_file))
     try:
-        copy_package_files(directory, build_directory)
+        if copy_files:
+            build_directory = tempfile.mkdtemp()
+            logger.debug("Created build directory: %s", format_path(build_directory))
+            # This no longer uses hard links because of all the file permission
+            # magic going on further down in this function (permissions are
+            # shared between all hard links pointing to an inode).
+            copy_package_files(directory, build_directory, hard_links=False)
+        else:
+            build_directory = directory
         clean_package_tree(build_directory)
         update_conffiles(build_directory)
         update_installed_size(build_directory)
+        # Sanitize the permission bits of the root directory. Most build
+        # directories will have been created with tempfile.mkdtemp() which
+        # creates the directory with mode 0700. The Debian packaging system
+        # really doesn't care about any of this, but:
+        #
+        #  1. It looks weird in the output of ``deb-pkg-tools -i`` :-)
+        #  2. When you convert a ``*.deb`` to ``*.rpm`` with Alien and install
+        #     the RPM the 0700 mode is actually applied to the system where you
+        #     install the package. As you can imagine, the results are
+        #     disastrous...
+        os.chmod(build_directory, 0o755)
         # Make sure all files included in the package are owned by `root'
         # (the only account guaranteed to exist on all systems).
-        logger.debug("Resetting file ownership (to root:root) ..")
-        execute('fakeroot', 'chown', '-R', 'root:root', build_directory, logger=logger)
+        root_user = os.environ.get('DPT_ROOT_USER', 'root')
+        root_group = os.environ.get('DPT_ROOT_GROUP', 'root')
+        user_spec = '%s:%s' % (root_user, root_group)
+        logger.debug("Resetting file ownership (to %s) ..", user_spec)
+        execute('chown', '-R', user_spec, build_directory, fakeroot=True, logger=logger)
+        # Reset the file modes of pre/post installation/removal scripts.
+        for script_name in ('preinst', 'postinst', 'prerm', 'postrm'):
+            script_path = os.path.join(build_directory, 'DEBIAN', script_name)
+            if os.path.isfile(script_path):
+                logger.debug("Resetting file modes (%s to 755) ..", script_path)
+                os.chmod(script_path, 0o755)
         # System packages generally install files that are read only and
         # readable (and possibly executable) for everyone (owner, group and
         # world) so we'll go ahead and remove some potentially harmful
         # permission bits (harmful enough that Lintian complains about them).
         logger.debug("Resetting file modes (go-w) ..")
-        execute('fakeroot', 'chmod', '-R', 'go-w', build_directory, logger=logger)
+        execute('chmod', '-R', 'go-w', build_directory, fakeroot=True, logger=logger)
+        # Remove the setgid bit from all directories in the package. Rationale:
+        # In my situation package templates are stored in a directory where a
+        # team of people have push access (I imagine that this is a common
+        # setup). To facilitate shared push access a shared primary UNIX group
+        # is used with the sticky bit on directories. However dpkg-deb *really*
+        # doesn't like this, failing with the error "dpkg-deb: control
+        # directory has bad permissions 2755 (must be >=0755 and <=0775)".
+        if coerce_boolean(os.environ.get('DPT_RESET_SETGID', 'true')):
+            logger.debug("Removing sticky bit from directories (g-s) ..")
+            execute('find -type d -print0 | xargs -0 chmod g-s', directory=build_directory, fakeroot=True, logger=logger)
+        # Make sure files in /etc/sudoers.d have the correct permissions.
+        sudoers_directory = os.path.join(build_directory, 'etc', 'sudoers.d')
+        if os.path.isdir(sudoers_directory):
+            for filename in os.listdir(sudoers_directory):
+                pathname = os.path.join(sudoers_directory, filename)
+                logger.debug("Resetting file modes (%s to 440) ..", pathname)
+                os.chmod(pathname, 0o440)
         # Build the package using `dpkg-deb'.
         logger.info("Building package in %s ..", format_path(build_directory))
-        execute('fakeroot', 'dpkg-deb', '--build', build_directory, package_file, logger=logger)
+        execute('dpkg-deb', '--build', build_directory, package_file, fakeroot=True, logger=logger)
         # Check the package for possible issues using Lintian?
         if check_package:
             if not os.access('/usr/bin/lintian', os.X_OK):
-                logger.warn("Lintian is not installed, skipping sanity check.")
+                logger.warning("Lintian is not installed, skipping sanity check.")
             else:
                 logger.info("Checking package for issues using Lintian ..")
                 lintian_command = ['lintian']
@@ -200,13 +554,15 @@ def build_package(directory, repository=None, check_package=True, copy_files=Tru
                 execute(*lintian_command, logger=logger, check=False)
         return package_file
     finally:
-        logger.debug("Removing build directory: %s", format_path(build_directory))
-        shutil.rmtree(build_directory)
+        if copy_files:
+            logger.debug("Removing build directory: %s", format_path(build_directory))
+            shutil.rmtree(build_directory)
 
 def determine_package_archive(directory):
     """
     Determine the name of the ``*.deb`` package archive that will be generated
-    from a directory tree suitable for packaging with ``dpkg-deb --build``.
+    from a directory tree suitable for packaging with ``dpkg-deb --build``. See
+    also :py:func:`parse_filename()`.
 
     :param source_directory: The pathname of a directory tree suitable for
                              packaging with ``dpkg-deb --build``.
@@ -220,7 +576,7 @@ def determine_package_archive(directory):
         components.append(architecture)
     return '%s.deb' % '_'.join(components)
 
-def copy_package_files(from_directory, to_directory):
+def copy_package_files(from_directory, to_directory, hard_links=True):
     """
     Copy a directory tree suitable for packaging with ``dpkg-deb --build`` to a
     temporary build directory so that individual files can be replaced without
@@ -231,45 +587,47 @@ def copy_package_files(from_directory, to_directory):
     :param from_directory: The pathname of a directory tree suitable for
                            packaging with ``dpkg-deb --build``.
     :param to_directory: The pathname of a temporary build directory.
+    :param hard_links: Use hard links to speed up copying when possible.
     """
     logger.info("Copying files (%s) to temporary directory (%s) ..",
                 format_path(from_directory), format_path(to_directory))
     command = ['cp', '-a']
     if not os.path.isdir(to_directory):
         os.makedirs(to_directory)
-    # Check whether we can use hard links to speed up the copy. In the past
-    # this used the following simple and obvious check:
-    #
-    #   os.stat(source_directory).st_dev == os.stat(build_directory).st_dev
-    #
-    # However this expression holds true inside schroot, yet `cp -al' fails
-    # when trying to create the hard links! This is why the following code now
-    # tries to create an actual hard link to verify that `cp -al' can be used.
-    test_file_from = None
-    test_file_to = None
-    try:
-        # Find a unique filename that we can create and destroy without
-        # touching any of the caller's files.
-        while True:
-            test_name = 'deb-pkg-tools-hard-link-test-%d' % random.randint(1, 1000)
-            test_file_from = os.path.join(from_directory, test_name)
-            test_file_to = os.path.join(to_directory, test_name)
-            if not os.path.isfile(test_file_from):
-                break
-        # Create the test file.
-        with open(test_file_from, 'w') as handle:
-            handle.write('test')
-        os.link(test_file_from, test_file_to)
-        logger.debug("Speeding up file copy using hard links ..")
-        command.append('-l')
-    except OSError:
-        pass
-    finally:
-        for test_file in [test_file_from, test_file_to]:
-            if test_file and os.path.isfile(test_file):
-                os.unlink(test_file)
-    # I know this looks really funky, but I'm 99% sure this is a valid
-    # use of shell escaping and globbing (obviously I tested it ;-).
+    if hard_links and coerce_boolean(os.environ.get('DPT_HARD_LINKS', 'true')):
+        # Check whether we can use hard links to speed up the copy. In the past
+        # this used the following simple and obvious check:
+        #
+        #   os.stat(source_directory).st_dev == os.stat(build_directory).st_dev
+        #
+        # However this expression holds true inside schroot, yet `cp -al' fails
+        # when trying to create the hard links! This is why the following code now
+        # tries to create an actual hard link to verify that `cp -al' can be used.
+        test_file_from = None
+        test_file_to = None
+        try:
+            # Find a unique filename that we can create and destroy without
+            # touching any of the caller's files.
+            while True:
+                test_name = 'deb-pkg-tools-hard-link-test-%d' % random.randint(1, 1000)
+                test_file_from = os.path.join(from_directory, test_name)
+                test_file_to = os.path.join(to_directory, test_name)
+                if not os.path.isfile(test_file_from):
+                    break
+            # Create the test file.
+            with open(test_file_from, 'w') as handle:
+                handle.write('test')
+            os.link(test_file_from, test_file_to)
+            logger.debug("Speeding up file copy using hard links ..")
+            command.append('-l')
+        except (IOError, OSError):
+            pass
+        finally:
+            for test_file in [test_file_from, test_file_to]:
+                if test_file and os.path.isfile(test_file):
+                    os.unlink(test_file)
+    # I know this looks really funky, but this is a valid use of shell escaping
+    # and globbing (obviously I tested it ;-).
     command.append('%s/*' % pipes.quote(from_directory))
     command.append(pipes.quote(to_directory))
     execute(' '.join(command), logger=logger)
@@ -327,7 +685,7 @@ def update_conffiles(directory):
                 if os.path.isfile(pathname):
                     conffiles.add(filename)
                 else:
-                    logger.warn("Stripping invalid entry: %s", filename)
+                    logger.warning("Stripping invalid entry: %s", filename)
         os.unlink(conffiles_file)
     # Make sure all regular files in /etc/ are marked as configuration files.
     for root, dirs, files in os.walk(os.path.join(directory, 'etc')):
@@ -356,9 +714,10 @@ def update_installed_size(directory):
 
     .. _Installed-Size: http://www.debian.org/doc/debian-policy/ch-controlfields.html#s-f-Installed-Size
     """
+
     # Find the installed size of the package (a rough estimate is fine).
     logger.debug("Finding installed size of package ..")
-    output = execute('du', '-sB', '1024', directory, logger=logger, capture=True)
+    output = execute('du', '-sk', directory, logger=logger, capture=True)
     installed_size = output.split()[0]
     # Patch the DEBIAN/control file.
     control_file = os.path.join(directory, 'DEBIAN', 'control')

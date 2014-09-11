@@ -8,19 +8,34 @@ the `deb-pkg-tools` package.
 
 .. note:: Most of the functions defined by `deb-pkg-tools` depend on external
    programs. If these programs fail unexpectedly (end with a nonzero exit code)
-   :py:exc:`deb_pkg_tools.utils.ExternalCommandFailed` is raised.
+   :py:exc:`executor.ExternalCommandFailed` is raised.
 
-.. automodule:: deb_pkg_tools.package
+.. automodule:: deb_pkg_tools.cache
+   :members:
+
+.. automodule:: deb_pkg_tools.checks
+   :members:
+
+.. automodule:: deb_pkg_tools.config
    :members:
 
 .. automodule:: deb_pkg_tools.control
    :members:
 
-.. automodule:: deb_pkg_tools.repo
+.. automodule:: deb_pkg_tools.deps
    :members:
 
 .. automodule:: deb_pkg_tools.gpg
    :members:
 
+.. automodule:: deb_pkg_tools.package
+   :members:
+
+.. automodule:: deb_pkg_tools.repo
+   :members:
+
 .. automodule:: deb_pkg_tools.utils
+   :members:
+
+.. automodule:: deb_pkg_tools.version
    :members:

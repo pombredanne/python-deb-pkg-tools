@@ -1,7 +1,7 @@
 # Debian packaging tools: GPG key pair generation.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: November 2, 2013
+# Last Change: August 30, 2014
 # URL: https://github.com/xolox/python-deb-pkg-tools
 
 """
@@ -15,6 +15,7 @@ key pairs that don't exist yet.
 
 # Standard library modules.
 import logging
+import multiprocessing
 import os.path
 import pipes
 import tempfile
@@ -22,10 +23,11 @@ import textwrap
 import time
 
 # External dependencies.
+from executor import execute
 from humanfriendly import format_path, format_timespan
 
 # Modules included in our package.
-from deb_pkg_tools.utils import execute, find_home_directory
+from deb_pkg_tools.utils import coerce_boolean, find_home_directory
 
 # Initialize a logger.
 logger = logging.getLogger(__name__)
@@ -100,9 +102,9 @@ class GPGKey(object):
         # If the secret or public key file is provided, the other key file must
         # be provided as well.
         if secret_key_file and not public_key_file:
-            raise Exception, "You provided a GPG secret key file without a public key file; please provide both!"
+            raise Exception("You provided a GPG secret key file without a public key file; please provide both!")
         elif public_key_file and not secret_key_file:
-            raise Exception, "You provided a GPG public key file without a secret key file; please provide both!"
+            raise Exception("You provided a GPG public key file without a secret key file; please provide both!")
 
         # If neither of the key files is provided we'll default to the
         # locations that GnuPG uses by default.
@@ -115,20 +117,21 @@ class GPGKey(object):
         # we won't generate them because that makes no sense :-)
         if key_id and not os.path.isfile(secret_key_file):
             text = "The provided GPG secret key file (%s) doesn't exist but a key ID was specified!"
-            raise Exception, text % secret_key_file
+            raise Exception(text % secret_key_file)
         if key_id and not os.path.isfile(public_key_file):
             text = "The provided GPG public key file (%s) doesn't exist but a key ID was specified!"
-            raise Exception, text % public_key_file
+            raise Exception(text % public_key_file)
 
         # If we're going to generate a GPG key for the caller we don't want to
         # overwrite a secret or public key file without its counterpart. We'll
         # also need a name and description for the generated key.
-        existing_files = filter(os.path.isfile, [secret_key_file, public_key_file])
+        existing_files = list(filter(os.path.isfile, [secret_key_file, public_key_file]))
         if len(existing_files) not in (0, 2):
             text = "Refusing to overwrite existing key file! (%s)"
-            raise Exception, text % existing_files[0]
+            raise Exception(text % existing_files[0])
         elif len(existing_files) == 0 and not (name and description):
-            raise Exception, "To generate a GPG key you must provide a name and description!"
+            logger.error("GPG key pair doesn't exist! (%s and %s)", format_path(secret_key_file), format_path(public_key_file))
+            raise Exception("To generate a GPG key you must provide a name and description!")
 
         # Store the arguments.
         self.name = name
@@ -177,7 +180,8 @@ class GPGKey(object):
                         "the concept of entropy and how to make more of it :-)")
             start_time = time.time()
             initialize_gnupg()
-            execute('gpg', '--batch', '--gen-key', gpg_script, logger=logger)
+            with EntropyGenerator():
+                execute('gpg', '--batch', '--gen-key', gpg_script, logger=logger)
             logger.info("Finished generating GPG key pair in %s.",
                         format_timespan(time.time() - start_time))
             os.unlink(gpg_script)
@@ -195,3 +199,69 @@ class GPGKey(object):
         if self.key_id:
             command.extend(['--recipient', self.key_id])
         return ' '.join(command)
+
+class EntropyGenerator(object):
+
+    """
+    Force the system to generate entropy based on disk I/O.
+
+    The `deb-pkg-tools` test suite runs on Travis CI which uses virtual
+    machines to isolate tests. Because the `deb-pkg-tools` test suite generates
+    several GPG keys it risks the chance of getting stuck and being killed
+    after 10 minutes of inactivity. This happens because of a lack of entropy
+    which is a very common problem in virtualized environments.
+    There are tricks to use fake entropy to avoid this problem:
+
+    - The `rng-tools` package/daemon can feed ``/dev/random`` based on
+      ``/dev/urandom``. Unfortunately this package doesn't work on Travis CI
+      because they use OpenVZ which uses read only ``/dev/random`` devices.
+
+    - GPG version 2 supports the ``--debug-quick-random`` option but I haven't
+      investigated how easy it is to switch.
+
+    Instances of this class can be used as a context manager to generate
+    endless disk I/O which is one of the few sources of entropy on virtualized
+    systems. Entropy generation is enabled when the environment variable
+    ``$DPT_FORCE_ENTROPY`` is set to ``yes``, ``true`` or ``1``.
+    """
+
+    def __init__(self):
+        self.enabled = coerce_boolean(os.environ.get('DPT_FORCE_ENTROPY', 'no'))
+        if self.enabled:
+            self.process = multiprocessing.Process(target=generate_entropy)
+
+    def __enter__(self):
+        if self.enabled:
+            logger.warning("Forcing entropy generation using disk I/O, performance will suffer ..")
+            self.process.start()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.enabled:
+            self.process.terminate()
+            logger.debug("Terminated entropy generation.")
+
+def generate_entropy():
+    """
+    Force the system to generate entropy based on disk I/O.
+
+    This function is run in a separate process by :py:class:`EntropyGenerator`.
+    It scans the complete file system and reads every file it finds in blocks
+    of 1 KB. This function never returns; it has to be killed.
+    """
+    # Continue until we are killed.
+    while True:
+        # Scan the complete file system.
+        for root, dirs, files in os.walk('/'):
+            for filename in files:
+                pathname = os.path.join(root, filename)
+                # Don't try to read device files, named pipes, etc.
+                if os.path.isfile(pathname):
+                    # Read every file on the file system in blocks of 1 KB.
+                    try:
+                        with open(pathname) as handle:
+                            while True:
+                                block = handle.read(1024)
+                                if not block:
+                                    break
+                    except Exception:
+                        pass
