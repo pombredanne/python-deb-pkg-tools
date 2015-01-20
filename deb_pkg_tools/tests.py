@@ -1,7 +1,7 @@
 # Debian packaging tools: Automated tests.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: August 31, 2014
+# Last Change: December 16, 2014
 # URL: https://github.com/xolox/python-deb-pkg-tools
 
 # Standard library modules.
@@ -35,7 +35,6 @@ from deb_pkg_tools.gpg import GPGKey
 from deb_pkg_tools.package import collect_related_packages, copy_package_files, find_latest_version, find_package_archives, group_by_latest_versions, inspect_package, parse_filename
 from deb_pkg_tools.printer import CustomPrettyPrinter
 from deb_pkg_tools.repo import apt_supports_trusted_option, update_repository
-from deb_pkg_tools.utils import coerce_boolean
 
 # Initialize a logger.
 logger = logging.getLogger(__name__)
@@ -255,12 +254,6 @@ class DebPkgToolsTestCase(unittest.TestCase):
         self.assertEqual(relationship_set.matches('python', '3.0'), False) # name in alternative matched, version didn't
         self.assertEqual(list(relationship_set.names), ['python'])
 
-    def test_relationship_sorting(self):
-        relationship_set = parse_depends('foo | bar, baz | qux')
-        self.assertEqual(relationship_set, RelationshipSet(
-            AlternativeRelationship(Relationship(name='baz'), Relationship(name='qux')),
-            AlternativeRelationship(Relationship(name='foo'), Relationship(name='bar'))))
-
     def test_custom_pretty_printer(self):
         printer = CustomPrettyPrinter()
         # Test pretty printing of debian.deb822.Deb822 objects.
@@ -292,13 +285,6 @@ class DebPkgToolsTestCase(unittest.TestCase):
         # Test the unhappy paths.
         self.assertRaises(ValueError, parse_filename, 'python2.7_2.7.3-0ubuntu3.4_amd64.not-a-deb')
         self.assertRaises(ValueError, parse_filename, 'python2.7.deb')
-
-    def test_boolean_coercion(self):
-        for value in ['YES', 'Yes', 'yes', 'TRUE', 'True', 'true', '1']:
-            self.assertEqual(coerce_boolean(value), True)
-        for value in ['NO', 'No', 'no', 'FALSE', 'False', 'false', '0']:
-            self.assertEqual(coerce_boolean(value), False)
-        self.assertRaises(ValueError, coerce_boolean, 'not a boolean!')
 
     def test_package_building(self, repository=None, overrides={}, contents={}):
         with Context() as finalizers:

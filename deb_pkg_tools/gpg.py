@@ -1,7 +1,7 @@
 # Debian packaging tools: GPG key pair generation.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: August 30, 2014
+# Last Change: November 15, 2014
 # URL: https://github.com/xolox/python-deb-pkg-tools
 
 """
@@ -24,10 +24,10 @@ import time
 
 # External dependencies.
 from executor import execute
-from humanfriendly import format_path, format_timespan
+from humanfriendly import coerce_boolean, format_path, format_timespan
 
 # Modules included in our package.
-from deb_pkg_tools.utils import coerce_boolean, find_home_directory
+from deb_pkg_tools.utils import find_home_directory
 
 # Initialize a logger.
 logger = logging.getLogger(__name__)
@@ -226,7 +226,7 @@ class EntropyGenerator(object):
     """
 
     def __init__(self):
-        self.enabled = coerce_boolean(os.environ.get('DPT_FORCE_ENTROPY', 'no'))
+        self.enabled = coerce_boolean(os.environ.get('DPT_FORCE_ENTROPY', 'false'))
         if self.enabled:
             self.process = multiprocessing.Process(target=generate_entropy)
 
