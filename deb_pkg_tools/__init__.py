@@ -1,16 +1,16 @@
 # Debian packaging tools.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: December 16, 2014
+# Last Change: May 4, 2016
 # URL: https://github.com/xolox/python-deb-pkg-tools
 
 # Semi-standard module versioning.
-__version__ = '1.29.3'
+__version__ = '1.36'
 
 debian_package_dependencies = (
     'apt',        # apt-get
     'apt-utils',  # apt-ftparchive
-    'dpkg-dev',   # dpkg-scanpackages
+    'dpkg-dev',   # dpkg-architecture
     'fakeroot',   # fakeroot
     'gnupg',      # gpg
     'lintian',    # lintian

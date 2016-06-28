@@ -1,7 +1,7 @@
 # Debian packaging tools: Automated tests.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: December 16, 2014
+# Last Change: July 16, 2015
 # URL: https://github.com/xolox/python-deb-pkg-tools
 
 # Standard library modules.
@@ -19,22 +19,27 @@ import unittest
 # External dependencies.
 import coloredlogs
 from debian.deb822 import Deb822
+from executor import execute
 
 # Modules included in our package.
 from deb_pkg_tools import version
 from deb_pkg_tools.cache import PackageCache
-from deb_pkg_tools.checks import check_duplicate_files, check_version_conflicts, DuplicateFilesFound, VersionConflictFound
+from deb_pkg_tools.checks import (check_duplicate_files, check_version_conflicts,
+                                  DuplicateFilesFound, VersionConflictFound)
 from deb_pkg_tools.cli import main
 from deb_pkg_tools.compat import StringIO, unicode
-from deb_pkg_tools.control import (deb822_from_string, load_control_file,
-                                   merge_control_fields, parse_control_fields,
-                                   unparse_control_fields)
-from deb_pkg_tools.deps import (AlternativeRelationship, VersionedRelationship,
-                                parse_depends, Relationship, RelationshipSet)
+from deb_pkg_tools.control import (create_control_file, deb822_from_string,
+                                   load_control_file, merge_control_fields,
+                                   parse_control_fields, unparse_control_fields)
+from deb_pkg_tools.deps import VersionedRelationship, parse_depends, Relationship, RelationshipSet
 from deb_pkg_tools.gpg import GPGKey
-from deb_pkg_tools.package import collect_related_packages, copy_package_files, find_latest_version, find_package_archives, group_by_latest_versions, inspect_package, parse_filename
+from deb_pkg_tools.package import (collect_related_packages, copy_package_files,
+                                   find_latest_version, find_package_archives,
+                                   group_by_latest_versions, inspect_package,
+                                   parse_filename)
 from deb_pkg_tools.printer import CustomPrettyPrinter
 from deb_pkg_tools.repo import apt_supports_trusted_option, update_repository
+from deb_pkg_tools.utils import find_debian_architecture
 
 # Initialize a logger.
 logger = logging.getLogger(__name__)
@@ -94,6 +99,10 @@ class DebPkgToolsTestCase(unittest.TestCase):
                 else:
                     self.load_package_cache()
 
+    def test_architecture_determination(self):
+        valid_architectures = execute('dpkg-architecture', '-L', capture=True).splitlines()
+        self.assertTrue(find_debian_architecture() in valid_architectures)
+
     def test_find_latest_version(self):
         good = ['name_1.0_all.deb', 'name_0.5_all.deb']
         self.assertEqual(os.path.basename(find_latest_version(good).filename), 'name_1.0_all.deb')
@@ -140,6 +149,28 @@ class DebPkgToolsTestCase(unittest.TestCase):
                                  'Version: 1.0',
                                  'Depends: python-deb-pkg-tools, python-pip, python-pip-accel',
                                  'Architecture: amd64']))
+
+    def test_control_file_creation(self):
+        with Context() as context:
+            directory = context.mkdtemp()
+            # Use a non-existing subdirectory to verify that it's created.
+            control_file = os.path.join(directory, 'DEBIAN', 'control')
+            # Try to create a control file but omit some mandatory fields.
+            self.assertRaises(ValueError, create_control_file, control_file, dict(Package='created-from-python'))
+            # Now we'll provide all of the required fields to actually create the file.
+            create_control_file(control_file, dict(
+                Package='created-from-python',
+                Description='whatever',
+                Maintainer='Peter Odding',
+                Version='1.0',
+            ))
+            # Load the control file to verify its contents.
+            control_fields = load_control_file(control_file)
+            # These fields were provided by us (the caller of create_control_file()).
+            assert control_fields['Package'] == 'created-from-python'
+            assert control_fields['Description'] == 'whatever'
+            # This field was written as a default value.
+            assert control_fields['Architecture'] == 'all'
 
     def test_control_file_patching_and_loading(self):
         deb822_package = Deb822(['Package: unpatched-example',
@@ -441,10 +472,52 @@ class DebPkgToolsTestCase(unittest.TestCase):
             directory = finalizers.mkdtemp()
             package1 = self.test_package_building(directory, overrides=dict(Package='deb-pkg-tools-package-1', Depends='deb-pkg-tools-package-2'))
             package2 = self.test_package_building(directory, overrides=dict(Package='deb-pkg-tools-package-2', Depends='deb-pkg-tools-package-3'))
-            self.test_package_building(directory, overrides=dict(Package='deb-pkg-tools-package-3'))
-            package4 = self.test_package_building(directory, overrides=dict(Package='deb-pkg-tools-package-3', Version='0.2'))
-            self.assertEqual(sorted(p.filename for p in collect_related_packages(package1, cache=self.package_cache)), [package2, package4])
+            package3_1 = self.test_package_building(directory, overrides=dict(Package='deb-pkg-tools-package-3', Version='0.1'))
+            package3_2 = self.test_package_building(directory, overrides=dict(Package='deb-pkg-tools-package-3', Version='0.2'))
+            related_packages = [p.filename for p in collect_related_packages(package1, cache=self.package_cache)]
+            # Make sure deb-pkg-tools-package-2 was collected.
+            assert package2 in related_packages
+            # Make sure deb-pkg-tools-package-3 version 0.1 wasn't collected.
+            assert package3_1 not in related_packages
+            # Make sure deb-pkg-tools-package-3 version 0.2 was collected.
+            assert package3_2 in related_packages
 
+    def test_collect_packages_preference_for_newer_versions(self):
+        with Context() as finalizers:
+            directory = finalizers.mkdtemp()
+            package1 = self.test_package_building(directory, overrides=dict(Package='deb-pkg-tools-package-1', Depends='deb-pkg-tools-package-2'))
+            package2_1 = self.test_package_building(directory, overrides=dict(Package='deb-pkg-tools-package-2', Version='1', Depends='deb-pkg-tools-package-3 (= 1)'))
+            package2_2 = self.test_package_building(directory, overrides=dict(Package='deb-pkg-tools-package-2', Version='2', Depends='deb-pkg-tools-package-3 (= 2)'))
+            package3_1 = self.test_package_building(directory, overrides=dict(Package='deb-pkg-tools-package-3', Version='1'))
+            package3_2 = self.test_package_building(directory, overrides=dict(Package='deb-pkg-tools-package-3', Version='2'))
+            related_packages = [p.filename for p in collect_related_packages(package1, cache=self.package_cache)]
+            # Make sure deb-pkg-tools-package-2 version 1 wasn't collected.
+            assert package2_1 not in related_packages
+            # Make sure deb-pkg-tools-package-2 version 2 was collected.
+            assert package2_2 in related_packages
+            # Make sure deb-pkg-tools-package-3 version 1 wasn't collected.
+            assert package3_1 not in related_packages
+            # Make sure deb-pkg-tools-package-3 version 2 was collected.
+            assert package3_2 in related_packages
+
+    def test_collect_packages_with_conflict_resolution(self):
+        with Context() as finalizers:
+            directory = finalizers.mkdtemp()
+            # The following names are a bit confusing, this is to enforce implicit sorting on file system level (exposing an otherwise unnoticed bug).
+            package_a = self.test_package_building(directory, overrides=dict(Package='package-a', Depends='package-b, package-c'))
+            package_b = self.test_package_building(directory, overrides=dict(Package='package-b', Depends='package-d'))
+            package_c = self.test_package_building(directory, overrides=dict(Package='package-c', Depends='package-d (= 1)'))
+            package_d1 = self.test_package_building(directory, overrides=dict(Package='package-d', Version='1'))
+            package_d2 = self.test_package_building(directory, overrides=dict(Package='package-d', Version='2'))
+            related_packages = [p.filename for p in collect_related_packages(package_a, cache=self.package_cache)]
+            # Make sure package-b was collected.
+            assert package_b in related_packages
+            # Make sure package-c was collected.
+            assert package_c in related_packages
+            # Make sure package-d1 was collected.
+            assert package_d1 in related_packages
+            # Make sure package-d2 wasn't collected.
+            assert package_d2 not in related_packages
 
     def test_repository_creation(self, preserve=False):
         if not SKIP_SLOW_TESTS:

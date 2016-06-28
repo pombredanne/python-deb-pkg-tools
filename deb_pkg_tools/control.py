@@ -1,7 +1,7 @@
 # Debian packaging tools: Control file manipulation.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: August 31, 2014
+# Last Change: September 24, 2015
 # URL: https://github.com/xolox/python-deb-pkg-tools
 
 """
@@ -24,18 +24,55 @@ import textwrap
 
 # External dependencies.
 from debian.deb822 import Deb822
-from humanfriendly import format_path
+from humanfriendly import concatenate, format_path, pluralize
 
 # Modules included in our package.
 from deb_pkg_tools.compat import basestring, StringIO, unicode
 from deb_pkg_tools.deps import parse_depends, RelationshipSet
+from deb_pkg_tools.utils import makedirs
 
 # Initialize a logger.
 logger = logging.getLogger(__name__)
 
-# Control file fields that are like `Depends:' (they contain a comma
-# separated list of package names with optional version specifications).
-DEPENDS_LIKE_FIELDS = ('Conflicts', 'Depends', 'Provides', 'Replaces', 'Suggests')
+MANDATORY_BINARY_CONTROL_FIELDS = (
+    'Architecture',
+    'Description',
+    'Maintainer',
+    'Package',
+    'Version',
+)
+"""
+A tuple of strings with the canonical names of the mandatory binary control
+file fields as defined by the `Debian policy manual
+<https://www.debian.org/doc/debian-policy/ch-controlfields.html#s-binarycontrolfiles>`_.
+"""
+
+DEFAULT_CONTROL_FIELDS = {
+    'Architecture': 'all',
+    'Priority': 'optional',
+    'Section': 'misc',
+}
+"""
+A dictionary with string key/value pairs. Each key is the canonical name of a
+binary control file field and each value is the default value given to that
+field by :func:`create_control_file()` when the caller hasn't defined a value
+for the field.
+"""
+
+DEPENDS_LIKE_FIELDS = (
+    'Breaks',
+    'Conflicts',
+    'Depends',
+    'Pre-Depends',
+    'Provides',
+    'Replaces',
+    'Suggests',
+)
+"""
+A tuple of strings with the canonical names of binary control file fields that
+are like the ``Depends`` field (in the sense that they contain a comma
+separated list of package names with optional version specifications).
+"""
 
 def load_control_file(control_file):
     """
@@ -46,6 +83,36 @@ def load_control_file(control_file):
     """
     with open(control_file) as handle:
         return parse_control_fields(Deb822(handle))
+
+def create_control_file(control_file, control_fields):
+    """
+    Create a Debian control file.
+
+    :param control_file: The filename of the control file to create (a string).
+    :param control_fields: A dictionary with control file fields. This
+                           dictionary is merged with the values in
+                           :data:`DEFAULT_CONTROL_FIELDS`.
+    :raises: :exc:`~exceptions.ValueError` when a mandatory binary control
+             field is not present in the provided control fields (see also
+             :data:`MANDATORY_BINARY_CONTROL_FIELDS`).
+    """
+    logger.debug("Creating control file: %s", format_path(control_file))
+    # Merge the defaults with the fields defined by the caller.
+    merged_fields = merge_control_fields(DEFAULT_CONTROL_FIELDS, control_fields)
+    # Sanity check for mandatory fields that are missing.
+    missing_fields = [f for f in MANDATORY_BINARY_CONTROL_FIELDS if f not in merged_fields]
+    if missing_fields:
+        raise ValueError("Missing %s! (%s)" % (pluralize(len(missing_fields), "mandatory binary package control field"),
+                                               concatenate(sorted(missing_fields))))
+    # Make sure the parent directory of the control file exists.
+    makedirs(os.path.dirname(control_file))
+    # Remove the control file if it already exists in case it's a hard link to
+    # an inode with multiple hard links that should _not_ be changed by us.
+    if os.path.exists(control_file):
+        os.unlink(control_file)
+    # Write the control file.
+    with open(control_file, 'wb') as handle:
+        merged_fields.dump(handle)
 
 def patch_control_file(control_file, overrides):
     """
@@ -162,14 +229,14 @@ def parse_control_fields(input_fields):
     >>> print(repr(parsed_fields))
     {'Architecture': u'amd64',
      'Conflicts': RelationshipSet(VersionedRelationship(name=u'binfmt-support', operator=u'<<', version=u'1.1.2')),
-     'Depends': RelationshipSet(VersionedRelationship(name=u'libexpat1', operator=u'>=', version=u'1.95.8'),
+     'Depends': RelationshipSet(VersionedRelationship(name=u'libpython3.4-minimal', operator=u'=', version=u'3.4.0-1+precise1'),
+                                VersionedRelationship(name=u'libexpat1', operator=u'>=', version=u'1.95.8'),
                                 VersionedRelationship(name=u'libgcc1', operator=u'>=', version=u'1:4.1.1'),
-                                VersionedRelationship(name=u'libpython3.4-minimal', operator=u'=', version=u'3.4.0-1+precise1'),
                                 VersionedRelationship(name=u'zlib1g', operator=u'>=', version=u'1:1.2.0'),
-                                AlternativeRelationship(Relationship(name=u'bar'), Relationship(name=u'foo'))),
+                                AlternativeRelationship(Relationship(name=u'foo'), Relationship(name=u'bar'))),
      'Installed-Size': 3586,
      'Package': u'python3.4-minimal',
-     'Pre-Depends': u'libc6 (>= 2.15)',
+     'Pre-Depends': RelationshipSet(VersionedRelationship(name=u'libc6', operator=u'>=', version=u'2.15')),
      'Recommends': u'python3.4',
      'Suggests': RelationshipSet(Relationship(name=u'binfmt-support')),
      'Version': u'3.4.0-1+precise1'}

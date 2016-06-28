@@ -1,7 +1,7 @@
 # Debian packaging tools: Caching of package metadata.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: December 16, 2014
+# Last Change: September 24, 2015
 # URL: https://github.com/xolox/python-deb-pkg-tools
 
 """
@@ -35,6 +35,7 @@ use case if you're using `deb-pkg-tools` seriously).
 """
 
 # Standard library modules.
+import codecs
 import logging
 import os
 import sqlite3
@@ -121,10 +122,22 @@ class PackageCache(object):
                         contents blob null
                     );
                 ''')
+                # In deb-pkg-tools 1.32.1 the parsing of the `Pre-Depends'
+                # field was changed. Because of this change data cached by
+                # older versions of deb-pkg-tools cannot be used by newer
+                # versions of deb-pkg-tools.
+                self.upgrade_schema(2, 'delete from package_cache;')
+                # In deb-pkg-tools 1.35 the parsing of the `Breaks' field was
+                # changed. Because of this change data cached by older versions
+                # of deb-pkg-tools cannot be used by newer versions of
+                # deb-pkg-tools.
+                self.upgrade_schema(3, 'delete from package_cache;')
             # Enable 8-bit bytestrings so we can store binary data.
             try:
+                # Python 3.x.
                 self.db.text_factory = bytes
             except NameError:
+                # Python 2.x.
                 self.db.text_factory = str
             # Use a custom row factory to implement lazy evaluation. Previously
             # this used functools.partial() to inject self (a PackageCache
@@ -286,7 +299,11 @@ class CachedPackage(sqlite3.Row):
 
         :returns: The pathname (a string).
         """
-        return str(self['pathname']).decode(self.cache.character_encoding)
+        # Due to our use of text_factory, self['pathname'] is a buffer object in
+        # Python 2.x and a bytes object in Python 3.x. The buffer object will
+        # not have a decode() method so we use codecs.decode() as a `universal
+        # method' avoiding a dedicated code path for Python 2.x vs 3.x.
+        return codecs.decode(self['pathname'], self.cache.character_encoding)
 
     @property
     def timestamp(self):
