@@ -1,16 +1,10 @@
 # Debian packaging tools: Package manipulation.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: May 1, 2015
+# Last Change: January 27, 2017
 # URL: https://github.com/xolox/python-deb-pkg-tools
 
-"""
-Package manipulation
-====================
-
-This module provides functions to build and inspect Debian package archives
-(``*.deb`` files).
-"""
+"""Functions to build and inspect Debian binary package archives (``*.deb`` files)."""
 
 # Standard library modules.
 import collections
@@ -34,34 +28,55 @@ from humanfriendly import coerce_boolean, concatenate, format_path, pluralize, S
 from deb_pkg_tools.control import (deb822_from_string,
                                    parse_control_fields,
                                    patch_control_file)
+from deb_pkg_tools.utils import makedirs
 from deb_pkg_tools.version import Version
 
 # Initialize a logger.
 logger = logging.getLogger(__name__)
 
+# The filename extensions of Debian binary package archives.
+BINARY_PACKAGE_ARCHIVE_EXTENSIONS = ('.deb', '.udeb')
+
 # The names of control file fields that specify dependencies.
 DEPENDENCY_FIELDS = ('Depends', 'Pre-Depends')
 
 # http://lintian.debian.org/tags/package-contains-vcs-control-dir.html
-DIRECTORIES_TO_REMOVE = ('.bzr', # Bazaar
-                         '.git', # Git
-                         '.hg',  # Mercurial
-                         '.svn', # SVN
-                         '__pycache__') # Python 3.x byte code files (http://lintian.debian.org/tags/package-installs-python-pycache-dir.html)
+DIRECTORIES_TO_REMOVE = (
+    '.bzr',  # Bazaar (version control system).
+    '.git',  # Git (version control system).
+    '.hg',   # Mercurial (version control system).
+    '.svn',  # SVN (version control system).
+    # Python 3 byte code files, see http://lintian.debian.org/tags/package-installs-python-pycache-dir.html.
+    '__pycache__',
+)
 
-FILES_TO_REMOVE = ('*.pyc',            # Python byte code files (http://lintian.debian.org/tags/package-installs-python-bytecode.html)
-                   '*.pyo',            # Python optimized byte code files (http://lintian.debian.org/tags/package-installs-python-bytecode.html)
-                   '*~',               # Emacs/Vim backup files (http://lintian.debian.org/tags/backup-file-in-package.html)
-                   '.*.s??',           # Vim named swap files
-                   '.bzrignore',       # Bazaar ignore files (http://lintian.debian.org/tags/package-contains-vcs-control-file.html)
-                   '.DS_Store',        # Mac OS X custom folder attributes (http://lintian.debian.org/tags/macos-ds-store-file-in-package.html)
-                   '.DS_Store.gz',     # Mac OS X custom folder attributes (http://lintian.debian.org/tags/macos-ds-store-file-in-package.html)
-                   '._*',              # Mac OS X resource fork (http://lintian.debian.org/tags/macos-resource-fork-file-in-package.html)
-                   '.gitignore',       # Git ignore files (http://lintian.debian.org/tags/package-contains-vcs-control-file.html)
-                   '.hg_archival.txt', # Artefact of `hg archive' (http://lintian.debian.org/tags/package-contains-vcs-control-file.html)
-                   '.hgignore',        # Mercurial ignore files (http://lintian.debian.org/tags/package-contains-vcs-control-file.html)
-                   '.hgtags',          # Mercurial ignore files (http://lintian.debian.org/tags/package-contains-vcs-control-file.html)
-                   '.s??')             # Vim anonymous swap files
+FILES_TO_REMOVE = (
+    # Python byte code files, see http://lintian.debian.org/tags/package-installs-python-bytecode.html.
+    '*.pyc',
+    # Python optimized byte code files, see http://lintian.debian.org/tags/package-installs-python-bytecode.html.
+    '*.pyo',
+    # Emacs/Vim backup files, see http://lintian.debian.org/tags/backup-file-in-package.html.
+    '*~',
+    # Vim named swap files.
+    '.*.s??',
+    # Bazaar ignore files, see http://lintian.debian.org/tags/package-contains-vcs-control-file.html.
+    '.bzrignore',
+    # Mac OS X custom folder attributes, see http://lintian.debian.org/tags/macos-ds-store-file-in-package.html.
+    '.DS_Store',
+    '.DS_Store.gz',
+    # Mac OS X resource forks, see http://lintian.debian.org/tags/macos-resource-fork-file-in-package.html.
+    '._*',
+    # Git ignore files, see http://lintian.debian.org/tags/package-contains-vcs-control-file.html.
+    '.gitignore',
+    # Artefact of `hg archive', see http://lintian.debian.org/tags/package-contains-vcs-control-file.html.
+    '.hg_archival.txt',
+    # Mercurial ignore files, see http://lintian.debian.org/tags/package-contains-vcs-control-file.html.
+    '.hgignore',
+    # Mercurial tags files, see http://lintian.debian.org/tags/package-contains-vcs-control-file.html.
+    '.hgtags',
+    # Vim anonymous swap files
+    '.s??',
+)
 
 # Enable power users to customize how packages are built in order to enable
 # limited use of deb-pkg-tools in non-Debian environments like Mac OS X.
@@ -70,16 +85,18 @@ ALLOW_FAKEROOT_OR_SUDO = coerce_boolean(os.environ.get('DPT_ALLOW_FAKEROOT_OR_SU
 ALLOW_HARD_LINKS = coerce_boolean(os.environ.get('DPT_HARD_LINKS', 'true'))
 ALLOW_RESET_SETGID = coerce_boolean(os.environ.get('DPT_RESET_SETGID', 'true'))
 
+
 def parse_filename(filename):
     """
-    Parse the filename of a Debian binary package archive into three fields:
-    the name of the package, its version and its architecture. See also
-    :py:func:`determine_package_archive()`.
+    Parse the filename of a Debian binary package archive.
 
-    :param filename: The pathname of a ``*.deb`` archive (a string).
-    :returns: A :py:class:`PackageFile` object.
-    :raises: Raises :py:exc:`~exceptions.ValueError` when the given filename
-             cannot be parsed.
+    :param filename: The pathname of a Debian binary package archive (a string).
+    :returns: A :class:`PackageFile` object.
+    :raises: :exc:`~exceptions.ValueError` when the given filename cannot be parsed.
+
+    This function parses the filename of a Debian binary package archive into
+    three fields: the name of the package, its version and its architecture.
+    See also :func:`determine_package_archive()`.
 
     Here's an example:
 
@@ -97,8 +114,8 @@ def parse_filename(filename):
     pathname = os.path.abspath(filename)
     filename = os.path.basename(pathname)
     basename, extension = os.path.splitext(filename)
-    if extension != '.deb':
-        raise ValueError("Refusing to parse filename that doesn't have `.deb' extension! (%r)" % pathname)
+    if extension not in BINARY_PACKAGE_ARCHIVE_EXTENSIONS:
+        raise ValueError("Refusing to parse filename with unknown extension! (%r)" % pathname)
     components = basename.split('_')
     if len(components) != 3:
         raise ValueError("Filename doesn't have three underscore separated components! (%r)" % pathname)
@@ -107,57 +124,48 @@ def parse_filename(filename):
                        architecture=components[2],
                        filename=pathname)
 
+
 class PackageFile(collections.namedtuple('PackageFile', 'name, version, architecture, filename')):
 
     """
-    The function :py:func:`parse_filename()` reports the fields of a package
-    archive's filename as a :py:class:`PackageFile` object (a named tuple).
+    A named tuple with the result of :func:`parse_filename()`.
+
+    The function :func:`parse_filename()` reports the fields of a package
+    archive's filename as a :class:`PackageFile` object (a named tuple).
     Here are the fields supported by these named tuples:
 
-    .. py:attribute:: name
+    .. :attribute:: name
 
        The name of the package (a string).
 
-    .. py:attribute:: version
+    .. :attribute:: version
 
-       The version of the package (a :py:class:`.Version` object).
+       The version of the package (a :class:`.Version` object).
 
-    .. py:attribute:: architecture
+    .. :attribute:: architecture
 
        The architecture of the package (a string).
 
-    .. py:attribute:: filename
+    .. :attribute:: filename
 
        The absolute pathname of the package archive (a string).
 
-    The following fields are generated on demand:
+    The values of the :attr:`directory`, :attr:`other_versions` and
+    :attr:`newer_versions` properties are generated on demand.
 
-    .. py:attribute:: directory
-
-       The absolute pathname of the directory containing the package archive (a
-       string).
-
-    .. py:attribute:: other_versions
-
-       A list of :py:class:`PackageFile` objects with other versions of the
-       same package in the same directory.
-
-    .. py:attribute: newer_versions
-
-       A list of :py:class:`PackageFile` objects with newer versions of the
-       same package in the same directory.
-
-    :py:class:`PackageFile` objects support sorting according to Debian's
+    :class:`PackageFile` objects support sorting according to Debian's
     package version comparison algorithm as implemented in ``dpkg
     --compare-versions``.
     """
 
     @property
     def directory(self):
+        """The absolute pathname of the directory containing the package archive (a string)."""
         return os.path.dirname(self.filename)
 
     @property
     def other_versions(self):
+        """A list of :class:`PackageFile` objects with other versions of the same package in the same directory."""
         archives = []
         for other_archive in find_package_archives(self.directory):
             if self.name == other_archive.name and self.version != other_archive.version:
@@ -166,38 +174,47 @@ class PackageFile(collections.namedtuple('PackageFile', 'name, version, architec
 
     @property
     def newer_versions(self):
+        """A list of :class:`PackageFile` objects with newer versions of the same package in the same directory."""
         archives = []
         for other_archive in self.other_versions:
             if other_archive.version > self.version:
                 archives.append(other_archive)
         return archives
 
+
 def find_package_archives(directory):
     """
     Find the Debian package archive(s) in the given directory.
 
     :param directory: The pathname of a directory (a string).
-    :returns: A list of :py:class:`PackageFile` objects.
+    :returns: A list of :class:`PackageFile` objects.
     """
     archives = []
     for entry in os.listdir(directory):
-        if entry.endswith('.deb'):
+        if entry.endswith(BINARY_PACKAGE_ARCHIVE_EXTENSIONS):
             pathname = os.path.join(directory, entry)
             if os.path.isfile(pathname):
                 archives.append(parse_filename(pathname))
     return archives
 
-def collect_related_packages(filename, cache=None):
+
+def collect_related_packages(filename, cache=None, interactive=None):
     """
-    Collect the package archive(s) related to the given package archive. This
-    works by parsing and resolving the dependencies of the given package to
-    filenames of package archives, then parsing and resolving the dependencies
-    of those package archives, etc. until no more relationships can be resolved
-    to existing package archives.
+    Collect the package archive(s) related to the given package archive.
 
     :param filename: The filename of an existing ``*.deb`` archive (a string).
-    :param cache: The :py:class:`.PackageCache` to use (defaults to ``None``).
-    :returns: A list of :py:class:`PackageFile` objects.
+    :param cache: The :class:`.PackageCache` to use (defaults to :data:`None`).
+    :param interactive: :data:`True` to draw an interactive spinner on the
+                        terminal (see :class:`~humanfriendly.Spinner`),
+                        :data:`False` to skip the interactive spinner or
+                        :data:`None` to detect whether we're connected to an
+                        interactive terminal.
+    :returns: A list of :class:`PackageFile` objects.
+
+    This works by parsing and resolving the dependencies of the given package
+    to filenames of package archives, then parsing and resolving the
+    dependencies of those package archives, etc. until no more relationships
+    can be resolved to existing package archives.
 
     Known limitations / sharp edges of this function:
 
@@ -257,7 +274,7 @@ def collect_related_packages(filename, cache=None):
     while True:
         try:
             # Assuming there are no possible conflicts one call will be enough.
-            return collect_related_packages_helper(candidate_archives, given_archive, cache)
+            return collect_related_packages_helper(candidate_archives, given_archive, cache, interactive)
         except CollectedPackagesConflict as e:
             # If we do encounter conflicts we take the brute force approach of
             # removing the conflicting package archive(s) from the set of
@@ -272,11 +289,9 @@ def collect_related_packages(filename, cache=None):
             logger.info("Retrying related archive collection without %s ..",
                         pluralize(len(e.conflicts), "conflicting archive"))
 
-def collect_related_packages_helper(candidate_archives, given_archive, cache):
-    """
-    Internal helper that enables :py:func:`collect_related_packages()` to
-    perform conflict resolution (which would otherwise get very complex).
-    """
+
+def collect_related_packages_helper(candidate_archives, given_archive, cache, interactive):
+    """Internal helper for package collection to enable simple conflict resolution."""
     # Enable mutation of the candidate archives data structure inside the scope
     # of this function without mutating the original data structure.
     candidate_archives = copy.deepcopy(candidate_archives)
@@ -284,50 +299,50 @@ def collect_related_packages_helper(candidate_archives, given_archive, cache):
     archives_to_scan = [given_archive]
     collected_archives = []
     relationship_sets = set()
-    # Loop to collect the related packages.
-    spinner = Spinner(label="Collecting related packages", timer=Timer())
-    while archives_to_scan:
-        selected_archive = archives_to_scan.pop(0)
-        logger.debug("Scanning %s ..", format_path(selected_archive.filename))
-        # Find the relationships of the given package.
-        control_fields = inspect_package_fields(selected_archive.filename, cache)
-        for field_name in DEPENDENCY_FIELDS:
-            if field_name in control_fields:
-                relationship_sets.add(control_fields[field_name])
-        # For each group of package archives sharing the same package name ..
-        for package_name in sorted(candidate_archives):
-            # For each version of the package ..
-            for package_archive in list(candidate_archives[package_name]):
-                package_matches = match_relationships(package_archive, relationship_sets)
-                spinner.step()
-                if package_matches == True:
-                    logger.debug("Package archive matched all relationships: %s", package_archive.filename)
-                    # Move the selected version of the package archive from the
-                    # candidates to the list of selected package archives.
-                    collected_archives.append(package_archive)
-                    # Prepare to scan and collect dependencies of the selected
-                    # package archive in a future iteration of the outermost
-                    # (while) loop.
-                    archives_to_scan.append(package_archive)
-                    # Ignore all other versions of the package inside this call
-                    # to collect_related_packages_helper().
-                    candidate_archives.pop(package_name)
-                    # Break out of the loop to avoid scanning other versions of
-                    # this package archive; we've made our choice now.
-                    break
-                elif package_matches == False:
-                    # If we're sure we can exclude this version of the package
-                    # from future iterations it could be worth it to speed up
-                    # the process on big repositories / dependency sets.
-                    candidate_archives[package_name].remove(package_archive)
-                    # Keep looking for a match in another version.
-                elif package_matches == None:
-                    # Break out of the loop that scans multiple versions of the
-                    # same package because none of the relationship sets collected
-                    # so far reference the name of this package (this is intended
-                    # as a harmless optimization).
-                    break
-    spinner.clear()
+    # Render an interactive spinner as a simple means of feedback to the operator.
+    with Spinner(label="Collecting related packages", interactive=interactive, timer=Timer()) as spinner:
+        # Loop to collect the related packages.
+        while archives_to_scan:
+            selected_archive = archives_to_scan.pop(0)
+            logger.debug("Scanning %s ..", format_path(selected_archive.filename))
+            # Find the relationships of the given package.
+            control_fields = inspect_package_fields(selected_archive.filename, cache)
+            for field_name in DEPENDENCY_FIELDS:
+                if field_name in control_fields:
+                    relationship_sets.add(control_fields[field_name])
+            # For each group of package archives sharing the same package name ..
+            for package_name in sorted(candidate_archives):
+                # For each version of the package ..
+                for package_archive in list(candidate_archives[package_name]):
+                    package_matches = match_relationships(package_archive, relationship_sets)
+                    spinner.step()
+                    if package_matches is True:
+                        logger.debug("Package archive matched all relationships: %s", package_archive.filename)
+                        # Move the selected version of the package archive from the
+                        # candidates to the list of selected package archives.
+                        collected_archives.append(package_archive)
+                        # Prepare to scan and collect dependencies of the selected
+                        # package archive in a future iteration of the outermost
+                        # (while) loop.
+                        archives_to_scan.append(package_archive)
+                        # Ignore all other versions of the package inside this call
+                        # to collect_related_packages_helper().
+                        candidate_archives.pop(package_name)
+                        # Break out of the loop to avoid scanning other versions of
+                        # this package archive; we've made our choice now.
+                        break
+                    elif package_matches is False:
+                        # If we're sure we can exclude this version of the package
+                        # from future iterations it could be worth it to speed up
+                        # the process on big repositories / dependency sets.
+                        candidate_archives[package_name].remove(package_archive)
+                        # Keep looking for a match in another version.
+                    elif package_matches is None:
+                        # Break out of the loop that scans multiple versions of the
+                        # same package because none of the relationship sets collected
+                        # so far reference the name of this package (this is intended
+                        # as a harmless optimization).
+                        break
     # Check for conflicts in the collected set of related package archives.
     conflicts = [a for a in collected_archives if not match_relationships(a, relationship_sets)]
     if conflicts:
@@ -335,20 +350,23 @@ def collect_related_packages_helper(candidate_archives, given_archive, cache):
     else:
         return collected_archives
 
+
 def match_relationships(package_archive, relationship_sets):
     """
-    Internal helper that enables :py:func:`collect_related_packages_helper()`
-    to validate that all relationships are satisfied while the set of related
-    package archives is being collected and again afterwards to make sure that
-    no previously drawn conclusions were invalidated by additionally collected
+    Internal helper for package collection to validate that all relationships are satisfied.
+
+    This function enables :func:`collect_related_packages_helper()` to validate
+    that all relationships are satisfied while the set of related package
+    archives is being collected and again afterwards to make sure that no
+    previously drawn conclusions were invalidated by additionally collected
     package archives.
     """
     archive_matches = None
     for relationships in relationship_sets:
         status = relationships.matches(package_archive.name, package_archive.version)
-        if status == True and archive_matches != False:
+        if status is True and archive_matches is not False:
             archive_matches = True
-        elif status == False:
+        elif status is False:
             # This package archive specifically conflicts with (at least) one
             # of the given relationship sets.
             archive_matches = False
@@ -357,29 +375,32 @@ def match_relationships(package_archive, relationship_sets):
             break
     return archive_matches
 
+
 class CollectedPackagesConflict(Exception):
 
-    """Exception raised by :py:func:`collect_related_packages_helper()`."""
+    """Exception raised by :func:`collect_related_packages_helper()`."""
 
     def __init__(self, conflicts):
         """
-        Construct a :py:exc:`CollectedPackagesConflict` exception.
+        Construct a :exc:`CollectedPackagesConflict` exception.
 
-        :param conflicts: A list of conflicting :py:class:`PackageFile` objects.
+        :param conflicts: A list of conflicting :class:`PackageFile` objects.
         """
         self.conflicts = conflicts
 
+
 def find_latest_version(packages):
     """
-    Find the package archive with the highest version number. Uses
-    :py:class:`.Version` objects for version comparison. Raises
-    :py:exc:`ValueError` when not all of the given package archives share the
-    same package name.
+    Find the package archive with the highest version number.
 
     :param packages: A list of filenames (strings) and/or
-                     :py:class:`PackageFile` objects.
-    :returns: The :py:class:`PackageFile` with
+                     :class:`PackageFile` objects.
+    :returns: The :class:`PackageFile` with
               the highest version number.
+    :raises: :exc:`~exceptions.ValueError` when not all of the given package
+             archives share the same package name.
+
+    This function uses :class:`.Version` objects for version comparison.
     """
     packages = sorted(map(parse_filename, packages))
     names = set(p.name for p in packages)
@@ -388,14 +409,15 @@ def find_latest_version(packages):
         raise ValueError(msg % concatenate(sorted(names)))
     return packages[-1]
 
+
 def group_by_latest_versions(packages):
     """
     Group package archives by name of package and find latest version of each.
 
     :param packages: A list of filenames (strings) and/or
-                     :py:class:`PackageFile` objects.
+                     :class:`PackageFile` objects.
     :returns: A dictionary with package names as keys and
-              :py:class:`PackageFile` objects as values.
+              :class:`PackageFile` objects as values.
     """
     grouped_packages = collections.defaultdict(set)
     for value in packages:
@@ -403,28 +425,30 @@ def group_by_latest_versions(packages):
         grouped_packages[package.name].add(package)
     return dict((n, find_latest_version(p)) for n, p in grouped_packages.items())
 
+
 def inspect_package(archive, cache=None):
     """
     Get the metadata and contents from a ``*.deb`` archive.
 
     :param archive: The pathname of an existing ``*.deb`` archive.
-    :param cache: The :py:class:`.PackageCache` to use (defaults to ``None``).
+    :param cache: The :class:`.PackageCache` to use (defaults to :data:`None`).
     :returns: A tuple with two dictionaries:
 
-              1. The result of :py:func:`inspect_package_fields()`.
-              2. The result of :py:func:`inspect_package_contents()`.
+              1. The result of :func:`inspect_package_fields()`.
+              2. The result of :func:`inspect_package_contents()`.
     """
     return (inspect_package_fields(archive, cache),
             inspect_package_contents(archive, cache))
+
 
 def inspect_package_fields(archive, cache=None):
     r"""
     Get the fields (metadata) from a ``*.deb`` archive.
 
     :param archive: The pathname of an existing ``*.deb`` archive.
-    :param cache: The :py:class:`.PackageCache` to use (defaults to ``None``).
+    :param cache: The :class:`.PackageCache` to use (defaults to :data:`None`).
     :returns: A dictionary with control file fields (the result of
-              :py:func:`.parse_control_fields()`).
+              :func:`.parse_control_fields()`).
 
     Here's an example:
 
@@ -452,20 +476,26 @@ def inspect_package_fields(archive, cache=None):
 
     """
     if cache:
-        return cache[archive].control_fields
+        entry = cache.get_entry('control-fields', archive)
+        value = entry.get_value()
+        if value is not None:
+            return value
     listing = execute('dpkg-deb', '-f', archive, logger=logger, capture=True)
-    raw_control_fields = deb822_from_string(listing)
-    return parse_control_fields(raw_control_fields)
+    fields = parse_control_fields(deb822_from_string(listing))
+    if cache:
+        entry.set_value(fields)
+    return fields
+
 
 def inspect_package_contents(archive, cache=None):
     """
     Get the contents from a ``*.deb`` archive.
 
     :param archive: The pathname of an existing ``*.deb`` archive.
-    :param cache: The :py:class:`.PackageCache` to use (defaults to ``None``).
+    :param cache: The :class:`.PackageCache` to use (defaults to :data:`None`).
     :returns: A dictionary with the directories and files contained in the
               package. The dictionary keys are the absolute pathnames and the
-              dictionary values are :py:class:`ArchiveEntry` objects (see the
+              dictionary values are :class:`ArchiveEntry` objects (see the
               example below).
 
     An example:
@@ -492,7 +522,10 @@ def inspect_package_contents(archive, cache=None):
 
     """
     if cache:
-        return cache[archive].contents
+        entry = cache.get_entry('contents', archive)
+        value = entry.get_value()
+        if value is not None:
+            return value
     contents = {}
     for line in execute('dpkg-deb', '-c', archive, logger=logger, capture=True).splitlines():
         # Example output of dpkg-deb -c archive.deb:
@@ -509,83 +542,94 @@ def inspect_package_contents(archive, cache=None):
             pathname, _, target = pathname.partition(' link to ')
             target = re.sub('^./', '/', target)
         contents[pathname] = ArchiveEntry(permissions, owner, group, size, modified, target)
+    if cache:
+        entry.set_value(contents)
     return contents
 
+
 class ArchiveEntry(collections.namedtuple('ArchiveEntry', 'permissions, owner, group, size, modified, target')):
+
     """
-    The function :py:func:`inspect_package()` reports the contents of package
+    A named tuple with the result of :func:`inspect_package()`.
+
+    The function :func:`inspect_package()` reports the contents of package
     archives as a dictionary containing named tuples. Here are the fields
     supported by those named tuples:
 
-    .. py:attribute:: permissions
+    .. :attribute:: permissions
 
        The entry type and permission bits just like ``ls -l`` prints them (a string like `drwxr-xr-x`).
 
-    .. py:attribute:: owner
+    .. :attribute:: owner
 
        The username of the owner of the entry (a string).
 
-    .. py:attribute:: group
+    .. :attribute:: group
 
        The group name of group owning the entry (a string).
 
-    .. py:attribute:: size
+    .. :attribute:: size
 
        The size of the entry in bytes (an integer).
 
-    .. py:attribute:: modified
+    .. :attribute:: modified
 
        A string like ``2013-09-26 22:28``.
     """
 
+
 def build_package(directory, repository=None, check_package=True, copy_files=True):
     """
-    Create a Debian package using the ``dpkg-deb --build`` command. The
-    ``dpkg-deb --build`` command requires a certain directory tree layout and
-    specific files; for more information about this topic please refer to the
-    `Debian Binary Package Building HOWTO`_. The :py:func:`build_package()`
+    Create a Debian package using the ``dpkg-deb --build`` command.
+
+    :param directory: The pathname of a directory tree suitable for packaging
+                      with ``dpkg-deb --build``.
+    :param repository: The pathname of the directory where the generated
+                       ``*.deb`` archive should be stored.
+
+                       By default a temporary directory is created to store the
+                       generated archive, in this case the caller is
+                       responsible for cleaning up the directory.
+
+                       Before deb-pkg-tools 2.0 this defaulted to the system
+                       wide temporary directory which could result in corrupted
+                       archives during concurrent builds.
+    :param check_package: If :data:`True` (the default) Lintian_ is run to check
+                          the resulting package archive for possible issues.
+    :param copy_files: If :data:`True` (the default) the package's files are copied
+                       to a temporary directory before being modified. You can
+                       set this to :data:`False` if you're already working on a
+                       copy and don't want yet another copy to be made.
+    :returns: The pathname of the generated ``*.deb`` archive.
+    :raises: :exc:`executor.ExternalCommandFailed` if any of the external
+             commands invoked by this function fail.
+
+    The ``dpkg-deb --build`` command requires a certain directory tree layout
+    and specific files; for more information about this topic please refer to
+    the `Debian Binary Package Building HOWTO`_. The :func:`build_package()`
     function performs the following steps to build a package:
 
     1. Copies the files in the source directory to a temporary build directory.
     2. Updates the Installed-Size_ field in the ``DEBIAN/control`` file
        based on the size of the given directory (using
-       :py:func:`update_installed_size()`).
+       :func:`update_installed_size()`).
     3. Sets the owner and group of all files to ``root`` because this is the
        only user account guaranteed to always be available. This uses the
        ``fakeroot`` command so you don't actually need ``root`` access to use
-       :py:func:`build_package()`.
+       :func:`build_package()`.
     4. Runs the command ``fakeroot dpkg-deb --build`` to generate a Debian
        package from the files in the build directory.
     5. Runs Lintian_ to check the resulting package archive for possible
        issues. The result of Lintian is purely informational: If 'errors' are
        reported and Lintian exits with a nonzero status code, this is ignored
-       by :py:func:`build_package()`.
-
-    If any of the external commands invoked by this function fail,
-    :py:exc:`executor.ExternalCommandFailed` is raised. If this function
-    returns without raising an exception, the generated Debian package can be
-    found in the parent directory of the directory given as the first
-    argument.
-
-    :param directory: The pathname of a directory tree suitable for packaging
-                      with ``dpkg-deb --build``.
-    :param repository: The pathname of an existing directory where the
-                       generated ``*.deb`` archive should be stored (defaults
-                       to the system wide temporary directory).
-    :param check_package: If ``True`` (the default) Lintian_ is run to check
-                          the resulting package archive for possible issues.
-    :param copy_files: If ``True`` (the default) the package's files are copied
-                       to a temporary directory before being modified. You can
-                       set this to ``False`` if you're already working on a
-                       copy and don't want yet another copy to be made.
-    :returns: The pathname of the generated ``*.deb`` archive.
+       by :func:`build_package()`.
 
     .. _Debian Binary Package Building HOWTO: http://tldp.org/HOWTO/html_single/Debian-Binary-Package-Building-HOWTO/
     .. _Installed-Size: http://www.debian.org/doc/debian-policy/ch-controlfields.html#s-f-Installed-Size
     .. _Lintian: http://lintian.debian.org/
     """
     if not repository:
-        repository = tempfile.gettempdir()
+        repository = tempfile.mkdtemp(prefix='deb-pkg-tools-build-')
     package_file = os.path.join(repository, determine_package_archive(directory))
     logger.debug("Preparing to build package: %s", format_path(package_file))
     try:
@@ -675,15 +719,18 @@ def build_package(directory, repository=None, check_package=True, copy_files=Tru
             logger.debug("Removing build directory: %s", format_path(build_directory))
             shutil.rmtree(build_directory)
 
+
 def determine_package_archive(directory):
     """
-    Determine the name of the ``*.deb`` package archive that will be generated
-    from a directory tree suitable for packaging with ``dpkg-deb --build``. See
-    also :py:func:`parse_filename()`.
+    Determine the name of a package archive before building it.
 
     :param source_directory: The pathname of a directory tree suitable for
                              packaging with ``dpkg-deb --build``.
     :returns: The filename of the ``*.deb`` archive to be built.
+
+    This function determines the name of the ``*.deb`` package archive that
+    will be generated from a directory tree suitable for packaging with
+    ``dpkg-deb --build``. See also :func:`parse_filename()`.
     """
     with open(os.path.join(directory, 'DEBIAN', 'control')) as control_file:
         fields = Deb822(control_file)
@@ -693,24 +740,27 @@ def determine_package_archive(directory):
         components.append(architecture)
     return '%s.deb' % '_'.join(components)
 
+
 def copy_package_files(from_directory, to_directory, hard_links=True):
     """
-    Copy a directory tree suitable for packaging with ``dpkg-deb --build`` to a
-    temporary build directory so that individual files can be replaced without
-    changing the original directory tree. If the build directory is on the same
-    file system as the source directory, hard links are used to speed up the
-    copy. This function is used by :py:func:`build_package()`.
+    Copy package files to a temporary directory, using hard links when possible.
 
     :param from_directory: The pathname of a directory tree suitable for
                            packaging with ``dpkg-deb --build``.
     :param to_directory: The pathname of a temporary build directory.
     :param hard_links: Use hard links to speed up copying when possible.
+
+    This function copies a directory tree suitable for packaging with
+    ``dpkg-deb --build`` to a temporary build directory so that individual
+    files can be replaced without changing the original directory tree. If the
+    build directory is on the same file system as the source directory, hard
+    links are used to speed up the copy. This function is used by
+    :func:`build_package()`.
     """
     logger.info("Copying files (%s) to temporary directory (%s) ..",
                 format_path(from_directory), format_path(to_directory))
     command = ['cp', '-a']
-    if not os.path.isdir(to_directory):
-        os.makedirs(to_directory)
+    makedirs(to_directory)
     if hard_links and ALLOW_HARD_LINKS:
         # Check whether we can use hard links to speed up the copy. In the past
         # this used the following simple and obvious check:
@@ -749,14 +799,10 @@ def copy_package_files(from_directory, to_directory, hard_links=True):
     command.append(pipes.quote(to_directory))
     execute(' '.join(command), logger=logger)
 
+
 def clean_package_tree(directory, remove_dirs=DIRECTORIES_TO_REMOVE, remove_files=FILES_TO_REMOVE):
     """
-    Clean up files that should not be included in a Debian package from the
-    given directory. Uses the :py:mod:`fnmatch` module for directory and
-    filename matching. Matching is done on the base name of each directory and
-    file. This function assumes it is safe to unlink files from the given
-    directory (which it should be when :py:func:`copy_package_files()` was
-    previously called, e.g. by :py:func:`build_package()`).
+    Clean up files that should not be included in a Debian package from the given directory.
 
     :param directory: The pathname of the directory to clean (a string).
     :param remove_dirs: An iterable with filename patterns of directories that
@@ -766,6 +812,12 @@ def clean_package_tree(directory, remove_dirs=DIRECTORIES_TO_REMOVE, remove_file
                          should not be included in the package (e.g. version
                          control files like ``.gitignore`` and
                          ``.hgignore``).
+
+    Uses the :mod:`fnmatch` module for directory and filename matching.
+    Matching is done on the base name of each directory and file. This function
+    assumes it is safe to unlink files from the given directory (which it
+    should be when :func:`copy_package_files()` was previously called, e.g. by
+    :func:`build_package()`).
     """
     for root, dirs, files in os.walk(directory):
         for name in dirs:
@@ -779,15 +831,17 @@ def clean_package_tree(directory, remove_dirs=DIRECTORIES_TO_REMOVE, remove_file
                 logger.debug("Cleaning up file: %s", format_path(pathname))
                 os.unlink(pathname)
 
+
 def update_conffiles(directory):
     """
-    Given a directory tree suitable for packaging with ``dpkg-deb --build``
-    this function updates the entries in the ``DEBIAN/conffiles`` file. This
-    function is used by :py:func:`build_package()`.
+    Make sure the ``DEBIAN/conffiles`` file is up to date.
 
     :param directory: The pathname of a directory tree suitable for packaging
                       with ``dpkg-deb --build``.
 
+    Given a directory tree suitable for packaging with ``dpkg-deb --build``
+    this function updates the entries in the ``DEBIAN/conffiles`` file. This
+    function is used by :func:`build_package()`.
     """
     conffiles = set()
     conffiles_file = os.path.join(directory, 'DEBIAN', 'conffiles')
@@ -820,18 +874,20 @@ def update_conffiles(directory):
                 handle.write("%s\n" % filename)
         logger.debug("Wrote %s to %s!", pluralize(len(conffiles), "entry", "entries"), conffiles_file)
 
+
 def update_installed_size(directory):
     """
-    Given a directory tree suitable for packaging with ``dpkg-deb --build``
-    this function updates the Installed-Size_ field in the ``DEBIAN/control``
-    file. This function is used by :py:func:`build_package()`.
+    Make sure the ``Installed-Size`` field in ``DEBIAN/control`` is up to date.
 
     :param directory: The pathname of a directory tree suitable for packaging
                       with ``dpkg-deb --build``.
 
+    Given a directory tree suitable for packaging with ``dpkg-deb --build``
+    this function updates the Installed-Size_ field in the ``DEBIAN/control``
+    file. This function is used by :func:`build_package()`.
+
     .. _Installed-Size: http://www.debian.org/doc/debian-policy/ch-controlfields.html#s-f-Installed-Size
     """
-
     # Find the installed size of the package (a rough estimate is fine).
     logger.debug("Finding installed size of package ..")
     output = execute('du', '-sk', directory, logger=logger, capture=True)
@@ -839,5 +895,3 @@ def update_installed_size(directory):
     # Patch the DEBIAN/control file.
     control_file = os.path.join(directory, 'DEBIAN', 'control')
     patch_control_file(control_file, {'Installed-Size': installed_size})
-
-# vim: ts=4 sw=4 et

@@ -1,16 +1,15 @@
 # Debian packaging tools: Caching of package metadata.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: September 24, 2015
+# Last Change: February 1, 2017
 # URL: https://github.com/xolox/python-deb-pkg-tools
 
 """
-Package metadata cache
-======================
+Debian binary package metadata cache.
 
-The :py:class:`PackageCache` class implements a persistent, multiprocess cache
-for Debian binary package metadata using :py:mod:`sqlite3`. The cache supports
-the following binary package metadata:
+The :class:`PackageCache` class implements a persistent, multiprocess cache for
+Debian binary package metadata. The cache supports the following binary package
+metadata:
 
 - The control fields of packages;
 - The files installed by packages;
@@ -18,43 +17,72 @@ the following binary package metadata:
 
 The package metadata cache can speed up the following functions:
 
-- :py:func:`.collect_related_packages()`
-- :py:func:`.get_packages_entry()`
-- :py:func:`.inspect_package()`
-- :py:func:`.inspect_package_contents()`
-- :py:func:`.inspect_package_fields()`
-- :py:func:`.scan_packages()`
-- :py:func:`.update_repository()`
+- :func:`.collect_related_packages()`
+- :func:`.get_packages_entry()`
+- :func:`.inspect_package()`
+- :func:`.inspect_package_contents()`
+- :func:`.inspect_package_fields()`
+- :func:`.scan_packages()`
+- :func:`.update_repository()`
 
 Because a lot of functionality in `deb-pkg-tools` uses
-:py:func:`.inspect_package()` and its variants, the package metadata cache
+:func:`.inspect_package()` and its variants, the package metadata cache
 almost always provides a speedup compared to recalculating metadata on demand.
+
 The cache is especially useful when you're manipulating large package
 repositories where relatively little metadata changes (which is a pretty common
 use case if you're using `deb-pkg-tools` seriously).
+
+Internals
+---------
+
+For several years the package metadata cache was based on SQLite and this
+worked fine. Then I started experimenting with concurrent builds on the same
+build server and I ran into SQLite raising lock timeout errors. I switched
+SQLite to use the Write-Ahead Log (WAL) and things seemed to improve until
+I experienced several corrupt databases in situations where multiple writers
+and multiple readers were all hitting the cache at the same time.
+
+At this point I looked around for alternative cache backends with the following
+requirements:
+
+- Support for concurrent reading and writing without any locking or blocking.
+
+- It should not be possible to corrupt the cache, regardless of concurrency.
+
+- To keep system requirements to a minimum, it should not be required to have
+  a server (daemon) process running just for the cache to function.
+
+These conflicting requirements left me with basically no options :-). Based on
+previous good experiences I decided to try using the filesystem to store the
+cache, with individual files representing cache entries. Through atomic
+filesystem operations this strategy basically delegates all locking to the
+filesystem, which should be guaranteed to do the right thing (POSIX).
+
+Storing the cache on the filesystem like this has indeed appeared to solve all
+locking and corruption issues, but when the filesystem cache is cold (for
+example because you've just run a couple of heavy builds) it's still damn slow
+to scan the package metadata of a full repository with hundreds of archives...
+
+As a pragmatic performance optimization memcached was added to the mix. Any
+errors involving memcached are silently ignored which means memcached isn't
+required to use the cache; it's an optional optimization.
 """
 
 # Standard library modules.
-import codecs
+import errno
+import glob
 import logging
 import os
-import sqlite3
-import zlib
-
-# Load the fastest pickle module available to us.
-try:
-    import cPickle as pickle
-except ImportError:
-    import pickle
+import time
 
 # External dependencies.
-from cached_property import cached_property
-from humanfriendly import Timer
+import memcache
+from humanfriendly import Timer, format_timespan, pluralize
+from six.moves import cPickle as pickle
 
 # Modules included in our package.
-from deb_pkg_tools.package import inspect_package_contents, inspect_package_fields
-from deb_pkg_tools.repo import get_packages_entry
-from deb_pkg_tools.utils import atomic_lock, makedirs
+from deb_pkg_tools.utils import makedirs, sha1
 
 # Initialize a logger for this module.
 logger = logging.getLogger(__name__)
@@ -62,310 +90,239 @@ logger = logging.getLogger(__name__)
 # Instance of PackageCache, initialized on demand by get_default_cache().
 default_cache_instance = None
 
+
 def get_default_cache():
     """
     Load the default package cache stored inside the user's home directory.
 
     The location of the cache is configurable using the option
-    :py:data:`.package_cache_file`, however make sure you set that option
-    *before* calling :py:func:`get_default_cache()` because the cache will be
+    :data:`.package_cache_directory`, however make sure you set that option
+    *before* calling :func:`get_default_cache()` because the cache will be
     initialized only once.
 
-    :returns: A :py:class:`PackageCache` object.
+    :returns: A :class:`PackageCache` object.
     """
     global default_cache_instance
     if default_cache_instance is None:
-        from deb_pkg_tools.config import package_cache_file
-        default_cache_instance = PackageCache(filename=os.path.expanduser(package_cache_file))
+        from deb_pkg_tools.config import package_cache_directory
+        default_cache_instance = PackageCache(directory=package_cache_directory)
     return default_cache_instance
+
 
 class PackageCache(object):
 
-    """
-    A persistent, multi process cache for Debian binary package metadata.
-    """
+    """A persistent, multiprocess cache for Debian binary package metadata."""
 
-    def __init__(self, filename):
+    def __init__(self, directory):
         """
         Initialize a package cache.
 
-        :param filename: The pathname of the SQLite database file (a string).
+        :param directory: The pathname of the package cache directory (a string).
         """
-        self.character_encoding = 'utf-8'
-        self.db = None
-        self.db_timer = Timer(resumable=True)
-        self.decode_timer = Timer(resumable=True)
-        self.encode_timer = Timer(resumable=True)
-        self.filename = os.path.expanduser(filename)
-        self.fs_timer = Timer(resumable=True)
-        self.gc_enabled = False
-        self.gc_timer = Timer(resumable=True)
-        self.identity_map = {}
+        self.directory = directory
+        self.entries = {}
+        self.memcached = memcache.Client(['127.0.0.1:11211'])
+        self.use_memcached = True
 
-    def initialize(self):
+    def get_entry(self, category, pathname):
         """
-        Initialize (create and/or upgrade) the package cache database.
+        Get an object representing a cache entry.
+
+        :param category: The type of metadata that this cache entry represents
+                         (a string like 'control-fields', 'package-fields' or
+                         'contents').
+        :param pathname: The pathname of the package archive (a string).
+        :returns: A :class:`CacheEntry` object.
         """
-        if self.db is None:
-            # Create any missing directories.
-            makedirs(os.path.dirname(self.filename))
-            with atomic_lock(self.filename):
-                # Open the SQLite database connection, enable autocommit.
-                self.db = sqlite3.connect(database=self.filename, isolation_level=None)
-                # Initialize the database schema.
-                self.upgrade_schema(1, '''
-                    create table package_cache (
-                        pathname text primary key,
-                        timestamp real not null,
-                        control_fields blob null,
-                        package_fields blob null,
-                        contents blob null
-                    );
-                ''')
-                # In deb-pkg-tools 1.32.1 the parsing of the `Pre-Depends'
-                # field was changed. Because of this change data cached by
-                # older versions of deb-pkg-tools cannot be used by newer
-                # versions of deb-pkg-tools.
-                self.upgrade_schema(2, 'delete from package_cache;')
-                # In deb-pkg-tools 1.35 the parsing of the `Breaks' field was
-                # changed. Because of this change data cached by older versions
-                # of deb-pkg-tools cannot be used by newer versions of
-                # deb-pkg-tools.
-                self.upgrade_schema(3, 'delete from package_cache;')
-            # Enable 8-bit bytestrings so we can store binary data.
+        # Normalize the pathname so we can use it as a dictionary & cache key.
+        pathname = os.path.abspath(pathname)
+        # Check if the entry was previously initialized.
+        key = (category, pathname)
+        entry = self.entries.get(key)
+        if not entry:
+            # Initialize a new entry.
+            entry = CacheEntry(self, category, pathname)
+            self.entries[key] = entry
+        return entry
+
+    def collect_garbage(self, force=False, interval=60 * 60 * 24):
+        """
+        Delete any entries in the persistent cache that refer to deleted archives.
+
+        :param force: :data:`True` to force a full garbage collection run
+                      (defaults to :data:`False` which means garbage collection
+                      is performed only once per `interval`).
+        :param interval: The number of seconds to delay garbage collection when
+                         `force` is :data:`False` (a number, defaults to the
+                         equivalent of 24 hours).
+        """
+        timer = Timer()
+        num_checked = 0
+        num_deleted = 0
+        marker_file = os.path.join(self.directory, 'last-gc.txt')
+        if not os.path.isdir(self.directory):
+            logger.debug("Skipping garbage collection (cache directory doesn't exist).")
+            return
+        elif force:
+            logger.info("Performing forced garbage collection ..")
+        else:
+            # Check whether garbage collection is needed, the idea being that
+            # garbage collection can be expensive (given enough cache entries
+            # and/or a cold enough disk cache) so we'd rather not do it when
+            # it's not necessary.
+            logger.debug("Checking whether garbage collection is necessary ..")
             try:
-                # Python 3.x.
-                self.db.text_factory = bytes
-            except NameError:
-                # Python 2.x.
-                self.db.text_factory = str
-            # Use a custom row factory to implement lazy evaluation. Previously
-            # this used functools.partial() to inject self (a PackageCache
-            # object) into the CachedPackage constructor, however as of Python
-            # 3.4.2 this causes the following error to be raised:
-            #
-            #   TypeError: Row() does not take keyword arguments
-            #   https://travis-ci.org/xolox/python-deb-pkg-tools/jobs/44186883#L746
-            #
-            # Looks like this was caused by the changes referenced in
-            # http://bugs.python.org/issue21975.
-            class CachedPackagePartial(CachedPackage):
-                cache = self
-            self.db.row_factory = CachedPackagePartial
-
-    def upgrade_schema(self, version, script):
-        """
-        Upgrade the database schema on demand.
-
-        :param version: The version to upgrade to (an integer).
-        :param script: The SQL statement(s) to upgrade the schema (a string).
-        """
-        # Get the version of the database schema.
-        # http://www.sqlite.org/pragma.html#pragma_schema_version
-        cursor = self.execute('pragma user_version')
-        existing_version = cursor.fetchone()[0]
-        if existing_version < version:
-            logger.debug("Upgrading database schema from %i to %i ..", existing_version, version)
-            self.db.executescript(script)
-            self.execute('pragma user_version = %d' % version)
-
-    def collect_garbage(self, force=False):
-        """
-        Cleanup expired cache entries.
-        """
-        if self.gc_enabled or force:
-            self.initialize()
-            with self.gc_timer:
-                select_cursor = self.db.cursor()
-                delete_cursor = self.db.cursor()
-                logger.debug("Garbage collecting expired cache entries ..")
-                for package in select_cursor.execute('select pathname, timestamp from package_cache'):
-                    try:
-                        with self.fs_timer:
-                            assert package.timestamp == os.path.getmtime(package.pathname)
-                    except Exception:
-                        with self.db_timer:
-                            delete_cursor.execute('delete from package_cache where pathname = ?', (package.pathname,))
-                self.gc_enabled = False
-        self.dump_stats()
-
-    def dump_stats(self):
-        """
-        Write database statistics to the log stream.
-        """
-        logger.debug("Package cache statistics:"
-                + "\n - Spent %s on database I/O." % self.db_timer
-                + "\n - Spent %s on garbage collection." % self.gc_timer
-                + "\n - Spent %s on getmtime() calls." % self.fs_timer
-                + "\n - Spent %s on value encoding." % self.encode_timer
-                + "\n - Spent %s on value decoding." % self.decode_timer)
-
-    def __getitem__(self, pathname):
-        """
-        Get a Debian binary package archive's metadata from the cache.
-
-        :param pathname: The pathname of a Debian binary package archive (a string).
-        :returns: A :py:class:`CachedPackage` object.
-        :raises: :py:exc:`KeyError` when the Debian binary package archive doesn't exist.
-        """
-        self.initialize()
-        # Make sure the package archive exists on disk.
-        with self.fs_timer:
+                last_gc = os.path.getmtime(marker_file)
+            except Exception:
+                last_gc = 0
+            elapsed_time = time.time() - last_gc
+            logger.debug("Elapsed time since last garbage collection: %s",
+                         format_timespan(elapsed_time))
+            if elapsed_time < interval:
+                logger.debug("Skipping automatic garbage collection (elapsed time < interval).")
+                return
+            else:
+                logger.debug("Performing automatic garbage collection (elapsed time > interval).")
+        for cache_file in glob.glob(os.path.join(self.directory, '*', '*.pickle')):
             try:
-                pathname = os.path.realpath(pathname)
-                timestamp = os.path.getmtime(pathname)
-                key = pathname.encode(self.character_encoding)
-            except OSError:
-                msg = "Debian binary package archive doesn't exist! (%s)"
-                raise KeyError(msg % pathname)
-        # Get the package object from the identity map but fall back to
-        # the database if the object in the identity map is outdated.
-        package = self.identity_map.get(key)
-        if not (package and package.timestamp == timestamp):
-            select_query = 'select * from package_cache where pathname = ? and timestamp = ?'
-            cursor = self.execute(select_query, key, timestamp)
-            self.identity_map[key] = cursor.fetchone()
-        # Invalidate the cached package (if any) and create a new one?
-        package = self.identity_map.get(key)
-        if not (package and package.timestamp == timestamp):
-            self.execute('''
-                replace into package_cache (pathname, timestamp, control_fields, package_fields, contents)
-                values (?, ?, null, null, null)
-            ''', key, timestamp)
-            # Get the new cache entry.
-            select_query = 'select * from package_cache where pathname = ?'
-            cursor = self.execute(select_query, key)
-            self.identity_map[key] = cursor.fetchone()
-        # Always return an object from the identity map.
-        return self.identity_map[key]
+                with open(cache_file, 'rb') as handle:
+                    data = pickle.load(handle)
+                last_modified = os.path.getmtime(data['pathname'])
+                is_garbage = (last_modified != data['last_modified'])
+            except Exception:
+                is_garbage = True
+            if is_garbage:
+                try:
+                    os.unlink(cache_file)
+                    num_deleted += 1
+                except EnvironmentError as e:
+                    # Silence `No such file or directory' errors (e.g. due to
+                    # concurrent garbage collection runs) without accidentally
+                    # swallowing other exceptions (that we don't know how to
+                    # handle).
+                    if e.errno != errno.ENOENT:
+                        raise
+            num_checked += 1
+        # Record when garbage collection was last run.
+        with open(marker_file, 'a') as handle:
+            os.utime(marker_file, None)
+        status_level = logging.INFO if force else logging.DEBUG
+        if num_checked == 0:
+            logger.log(status_level, "Nothing to garbage collect (the cache is empty).")
+        else:
+            logger.log(status_level, "Checked %s, garbage collected %s in %s.",
+                       pluralize(num_checked, "cache entry", "cache entries"),
+                       pluralize(num_deleted, "cache entry", "cache entries"),
+                       timer)
 
-    def execute(self, query, *params):
+
+class CacheEntry(object):
+
+    """An entry in the package metadata cache provided by :class:`PackageCache`."""
+
+    def __init__(self, cache, category, pathname):
         """
-        Execute a query.
+        Initialize a :class:`CacheEntry` object.
 
-        :param query: The SQL query to execute (a string).
-        :param params: Zero or more substitution parameters (a tuple).
-        :returns: An :py:class:`sqlite3.Cursor` object.
+        :param cache: The :class:`PackageCache` that created this entry.
+        :param category: The type of metadata that this cache entry represents
+                         (a string like 'control-fields', 'package-fields' or
+                         'contents').
+        :param pathname: The pathname of the package archive (a string).
         """
-        with self.db_timer:
-            tokens = query.split()
-            query = ' '.join(tokens)
-            cursor = self.db.execute(query, params)
-            if tokens[0] != 'select':
-                self.gc_enabled = True
-            return cursor
+        # Store the arguments.
+        self.cache = cache
+        self.category = category
+        self.pathname = pathname
+        # Generate the entry's cache key and filename.
+        fingerprint = sha1(pathname)
+        self.cache_key = 'deb-pkg-tools:%s:%s' % (category, fingerprint)
+        self.cache_file = os.path.join(self.cache.directory, category, '%s.pickle' % fingerprint)
+        # Get the archive's last modified time.
+        self.last_modified = os.path.getmtime(pathname)
+        # Prepare to cache the value in memory.
+        self.in_memory = None
 
-    def encode(self, python_value):
+    def get_value(self):
         """
-        Encode a Python value so it can be stored in the cache.
+        Get the cache entry's value.
 
-        :param python_value: Any Python value that can be pickled.
+        :returns: A previously cached value or :data:`None` (when the value
+                  isn't available in the cache).
         """
-        with self.encode_timer:
-            pickled_data = pickle.dumps(python_value, pickle.HIGHEST_PROTOCOL)
-            compressed_data = zlib.compress(pickled_data)
-            return sqlite3.Binary(compressed_data)
+        # Check for a value that was previously cached in memory.
+        if self.up_to_date(self.in_memory):
+            return self.in_memory['value']
+        # Check for a value that was previously cached in memcached.
+        try:
+            from_mc = self.cache.memcached.get(self.cache_key)
+            if self.up_to_date(from_mc):
+                # Cache the value in memory.
+                self.in_memory = from_mc
+                return from_mc['value']
+        except Exception:
+            pass
+        # Check for a value that was previously cached on the filesystem.
+        try:
+            with open(self.cache_file, 'rb') as handle:
+                from_fs = pickle.load(handle)
+            if self.up_to_date(from_fs):
+                # Cache the value in memory and in memcached.
+                self.in_memory = from_fs
+                self.set_memcached()
+                return from_fs['value']
+        except Exception:
+            pass
 
-    def decode(self, database_value):
+    def set_value(self, value):
         """
-        Decode a value that was previously encoded with :py:func:`encode()`.
+        Set the cache entry's value.
 
-        :param database_value: An encoded Python value (a string).
+        :param value: The metadata to save in the cache.
         """
-        with self.decode_timer:
-            return pickle.loads(zlib.decompress(database_value))
+        # Cache the value in memory.
+        self.in_memory = dict(
+            pathname=self.pathname,
+            last_modified=self.last_modified,
+            value=value,
+        )
+        # Cache the value in memcached.
+        self.set_memcached()
+        # Cache the value on the filesystem.
+        directory, filename = os.path.split(self.cache_file)
+        temporary_file = os.path.join(directory, '.%s-%i' % (filename, os.getpid()))
+        try:
+            # Try to write the cache file.
+            self.write_file(temporary_file)
+        except EnvironmentError as e:
+            # We may be missing the cache directory.
+            if e.errno == errno.ENOENT:
+                # Make sure the cache directory exists.
+                makedirs(directory)
+                # Try to write the cache file again.
+                self.write_file(temporary_file)
+            else:
+                # Don't swallow exceptions we can't handle.
+                raise
+        # Move the temporary file into place, trusting the
+        # filesystem to handle this operation atomically.
+        os.rename(temporary_file, self.cache_file)
 
-class CachedPackage(sqlite3.Row):
-
-    """
-    Custom SQLite row factory that implements lazy evaluation.
-
-    The following attributes are always available:
-
-    - :py:attr:`pathname`
-    - :py:attr:`timestamp`
-
-    The following attributes are loaded on demand:
-
-    - :py:attr:`control_fields`
-    - :py:attr:`package_fields`
-    - :py:attr:`contents`
-    """
-
-    @cached_property
-    def pathname(self):
-        """
-        Get the pathname of the Debian binary package archive.
-
-        :returns: The pathname (a string).
-        """
-        # Due to our use of text_factory, self['pathname'] is a buffer object in
-        # Python 2.x and a bytes object in Python 3.x. The buffer object will
-        # not have a decode() method so we use codecs.decode() as a `universal
-        # method' avoiding a dedicated code path for Python 2.x vs 3.x.
-        return codecs.decode(self['pathname'], self.cache.character_encoding)
-
-    @property
-    def timestamp(self):
-        """
-        Get the last modified time of the Debian binary package archive.
-
-        :returns: The last modified time (a float).
-        """
-        return self['timestamp']
-
-    @cached_property
-    def control_fields(self):
-        """
-        The control fields extracted from the Debian binary package archive.
-
-        :returns: A dictionary with control fields generated by
-                  :py:func:`.inspect_package_fields()`.
-        """
-        if self['control_fields']:
+    def set_memcached(self):
+        """Helper for :func:`get_value()` and :func:`set_value()` to write to memcached."""
+        if self.cache.use_memcached:
             try:
-                return self.cache.decode(self['control_fields'])
-            except Exception as e:
-                logger.warning("Failed to load cached control fields of %s! (%s)", self.pathname, e)
-        control_fields = inspect_package_fields(self.pathname)
-        update_query = 'update package_cache set control_fields = ? where pathname = ?'
-        self.cache.execute(update_query, self.cache.encode(control_fields), self.pathname)
-        return control_fields
+                self.cache.memcached.set(self.cache_key, self.in_memory)
+            except Exception:
+                self.cache.use_memcached = False
 
-    @cached_property
-    def package_fields(self):
-        """
-        The control fields required in a ``Packages`` file.
+    def up_to_date(self, value):
+        """Helper for :func:`get_value()` to validate cached values."""
+        return (value and
+                value['pathname'] == self.pathname and
+                value['last_modified'] >= self.last_modified)
 
-        :returns: A dictionary with control fields generated by
-                  :py:func:`.get_packages_entry()`.
-        """
-        if self['package_fields']:
-            try:
-                return self.cache.decode(self['package_fields'])
-            except Exception as e:
-                logger.warning("Failed to load cached package fields of %s! (%s)", self.pathname, e)
-        package_fields = get_packages_entry(self.pathname)
-        update_query = 'update package_cache set package_fields = ? where pathname = ?'
-        self.cache.execute(update_query, self.cache.encode(package_fields), self.pathname)
-        return package_fields
-
-    @cached_property
-    def contents(self):
-        """
-        The contents extracted from the Debian binary package archive (a dictionary).
-
-        :returns: A dictionary with package contents just like the one returned
-                  by :py:func:`.inspect_package_contents()`.
-        """
-        if self['contents']:
-            try:
-                return self.cache.decode(self['contents'])
-            except Exception as e:
-                logger.warning("Failed to load cached contents of %s! (%s)", self.pathname, e)
-        contents = inspect_package_contents(self.pathname)
-        update_query = 'update package_cache set contents = ? where pathname = ?'
-        self.cache.execute(update_query, self.cache.encode(contents), self.pathname)
-        return contents
-
-# vim: ts=4 sw=4 et
+    def write_file(self, filename):
+        """Helper for :func:`set_value()` to cache values on the filesystem."""
+        with open(filename, 'wb') as handle:
+            pickle.dump(self.in_memory, handle)
