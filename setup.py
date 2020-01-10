@@ -3,7 +3,7 @@
 # Setup script for the `deb-pkg-tools' package.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: November 22, 2016
+# Last Change: September 12, 2019
 # URL: https://github.com/xolox/python-deb-pkg-tools
 
 """
@@ -69,6 +69,9 @@ setup(name='deb-pkg-tools',
       packages=find_packages(),
       test_suite='deb_pkg_tools.tests',
       install_requires=get_requirements('requirements.txt'),
+      extras_require={
+          'memcached': ['python-memcached >= 1.58'],
+      },
       entry_points=dict(console_scripts=[
           'deb-pkg-tools = deb_pkg_tools.cli:main',
       ]),
@@ -82,11 +85,12 @@ setup(name='deb-pkg-tools',
           'Operating System :: POSIX :: Linux',
           'Programming Language :: Python',
           'Programming Language :: Python :: 2',
-          'Programming Language :: Python :: 2.6',
           'Programming Language :: Python :: 2.7',
           'Programming Language :: Python :: 3',
           'Programming Language :: Python :: 3.4',
           'Programming Language :: Python :: 3.5',
+          'Programming Language :: Python :: 3.6',
+          'Programming Language :: Python :: 3.7',
           'Programming Language :: Python :: Implementation :: CPython',
           'Programming Language :: Python :: Implementation :: PyPy',
           'Topic :: Software Development',

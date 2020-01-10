@@ -7,11 +7,14 @@ deb-pkg-tools: Debian packaging tools
 .. image:: https://coveralls.io/repos/xolox/python-deb-pkg-tools/badge.png?branch=master
    :target: https://coveralls.io/r/xolox/python-deb-pkg-tools?branch=master
 
-The Python package `deb-pkg-tools` is a collection of functions to work with
-Debian packages and repositories. Some of those functions have a command line
-interface (see below) because they're very convenient to use in shell scripts,
-while other functions are meant to be called directly from Python code. It's
-currently tested on cPython 2.6, 2.7, 3.4 and 3.5 and PyPy (2.7).
+The Python package `deb-pkg-tools` is a collection of functions to build and
+inspect `Debian binary packages`_ and repositories of binary packages. Its
+primary use case is to automate builds.
+
+Some of the functionality is exposed in the command line interface (documented below)
+because it's very convenient to use in shell scripts, while other functionality
+is meant to be used as a Python API. The package is currently tested on cPython
+2.7, 3.4, 3.5, 3.6, 3.7 and PyPy (2.7).
 
 Please note that `deb-pkg-tools` is quite opinionated about how Debian binary
 packages should be built and it enforces some of these opinions on its users.
@@ -32,14 +35,41 @@ covered by automated tests; at the time of writing coverage is around 90% (some
 of the error handling is quite tricky to test if we also want to test the
 non-error case, which is of course the main focus :-)
 
-Installation and usage
-----------------------
+Installation
+------------
 
-You can install the `deb-pkg-tools` package using the following command::
+The `deb-pkg-tools` package is available on PyPI_ which means installation
+should be as simple as:
 
-    $ pip install deb-pkg-tools
+.. code-block:: sh
 
-After installation you'll have the ``deb-pkg-tools`` program available:
+   $ pip install deb-pkg-tools
+
+There's actually a multitude of ways to install Python packages (e.g. the `per
+user site-packages directory`_, `virtual environments`_ or just installing
+system wide) and I have no intention of getting into that discussion here, so
+if this intimidates you then read up on your options before returning to these
+instructions ;-).
+
+When `deb-pkg-tools` is being used to scan thousands of ``*.deb`` archives a
+significant speedup may be achieved using memcached:
+
+.. code-block:: sh
+
+   $ pip install "deb-pkg-tools[memcached]"
+
+Under the hood `deb-pkg-tools` uses several programs provided by Debian, the
+details are available in the dependencies_ section. To install these programs::
+
+  $ sudo apt-get install dpkg-dev fakeroot lintian
+
+Usage
+-----
+
+There are two ways to use the `deb-pkg-tools` package: As a command line
+program and as a Python API. For details about the Python API please refer to
+the API documentation available on `Read the Docs`_. The command line interface
+is described below.
 
 .. A DRY solution to avoid duplication of the `deb-pkg-tools --help' text:
 ..
@@ -50,7 +80,9 @@ After installation you'll have the ``deb-pkg-tools`` program available:
 
 **Usage:** `deb-pkg-tools [OPTIONS] ...`
 
-Wrapper for the deb-pkg-tools Python project that implements various tools to inspect, build and manipulate Debian binary package archives and related entities like trivial repositories.
+Wrapper for the deb-pkg-tools Python project that implements various tools to
+inspect, build and manipulate Debian binary package archives and related
+entities like trivial repositories.
 
 **Supported options:**
 
@@ -93,8 +125,7 @@ Wrapper for the deb-pkg-tools Python project that implements various tools to in
    cron job scheduled during idle hours :-)."
    "``-y``, ``--yes``",Assume the answer to interactive questions is yes.
    "``-v``, ``--verbose``",Make more noise! (useful during debugging)
-   "``-h``, ``--help``","Show this message and exit.
-   "
+   "``-h``, ``--help``",Show this message and exit.
 
 .. [[[end]]]
 
@@ -102,16 +133,13 @@ One thing to note is that the operation of ``deb-pkg-tools --update-repo`` can
 be influenced by a configuration file. For details about this, please refer to
 the documentation on `deb_pkg_tools.repo.select_gpg_key()`_.
 
-If you're interested in using `deb-pkg-tools` as a Python module, please refer
-to the function reference on `Read the Docs`_.
+.. _dependencies:
 
 Dependencies
 ------------
 
-The `deb-pkg-tools` package depends on the python-debian_ package for control
-file parsing (it will be automatically installed as a dependency). The
-following external programs are also required (depending on which functionality
-you need of course):
+The following external programs are required by `deb-pkg-tools` (depending on
+which functionality you want to use of course):
 
 =====================  =============
 Program                Package
@@ -201,13 +229,16 @@ License
 
 This software is licensed under the `MIT license`_.
 
-© 2016 Peter Odding.
+© 2018 Peter Odding.
 
 .. External references:
 .. _deb_pkg_tools.repo.select_gpg_key(): https://deb-pkg-tools.readthedocs.org/en/latest/#deb_pkg_tools.repo.select_gpg_key
+.. _Debian binary packages: https://www.debian.org/doc/debian-policy/ch-binary.html
 .. _GitHub: https://github.com/xolox/python-deb-pkg-tools
 .. _MIT license: http://en.wikipedia.org/wiki/MIT_License
+.. _per user site-packages directory: https://www.python.org/dev/peps/pep-0370/
 .. _peter@peterodding.com: peter@peterodding.com
 .. _PyPI: https://pypi.python.org/pypi/deb-pkg-tools
 .. _python-debian: https://pypi.python.org/pypi/python-debian
 .. _Read the Docs: https://deb-pkg-tools.readthedocs.org
+.. _virtual environments: http://docs.python-guide.org/en/latest/dev/virtualenvs/

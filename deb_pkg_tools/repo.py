@@ -1,7 +1,7 @@
 # Debian packaging tools: Trivial repository management.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: November 22, 2016
+# Last Change: October 25, 2018
 # URL: https://github.com/xolox/python-deb-pkg-tools
 
 """
@@ -43,6 +43,7 @@ import tempfile
 # External dependencies.
 from executor import execute, ExternalCommandFailed
 from humanfriendly import coerce_boolean, concatenate, format_path, Spinner, Timer
+from humanfriendly.decorators import cached
 from six.moves import configparser
 
 # Modules included in our package.
@@ -179,9 +180,38 @@ def update_repository(directory, release_fields={}, gpg_key=None, cache=None):
     :raises: :exc:`.ResourceLockedException` when the given repository
              directory is being updated by another process.
 
-    This function is based on the Debian commands ``dpkg-scanpackages``
-    (reimplemented as :class:`scan_packages()`) and ``apt-ftparchive`` (also
-    uses the external programs ``gpg`` and ``gzip``).
+    This function is based on the Debian programs dpkg-scanpackages_ and
+    apt-ftparchive_ and also uses gpg_ and gzip_. The following files are
+    generated:
+
+    ===============  ==========================================================
+    Filename         Description
+    ===============  ==========================================================
+    ``Packages``     Provides the metadata of all ``*.deb`` packages in the
+                     `trivial repository`_ as a single text file. Generated
+                     using :class:`scan_packages()` (as a faster alternative
+                     to dpkg-scanpackages_).
+    ``Packages.gz``  A compressed version of the package metadata generated
+                     using gzip_.
+    ``Release``      Metadata about the release and hashes of the ``Packages``
+                     and ``Packages.gz`` files. Generated using
+                     apt-ftparchive_.
+    ``Release.gpg``  An ASCII-armored detached GPG signature of the ``Release``
+                     file. Generated using ``gpg --armor --sign
+                     --detach-sign``.
+    ``InRelease``    The contents of the ``Release`` file and its GPG signature
+                     combined into a single human readable file. Generated
+                     using ``gpg --armor --sign --clearsign``.
+    ===============  ==========================================================
+
+    For more details about the ``Release.gpg`` and ``InRelease`` files please
+    refer to the Debian wiki's section on secure-apt_.
+
+    .. _apt-ftparchive: https://manpages.debian.org/apt-ftparchive
+    .. _dpkg-scanpackages: https://manpages.debian.org/dpkg-scanpackages
+    .. _gpg: https://manpages.debian.org/gpg
+    .. _gzip: https://manpages.debian.org/gzip
+    .. _secure-apt: https://wiki.debian.org/SecureApt
     """
     with atomic_lock(directory):
         timer = Timer()
@@ -198,8 +228,9 @@ def update_repository(directory, release_fields={}, gpg_key=None, cache=None):
             # not cause an unnecessary repository update. That would turn the
             # conditional update into an unconditional update, which is not the
             # intention here :-)
-            if os.path.isfile(os.path.join(directory, 'Release.gpg')) or gpg_key:
-                metadata_files.append('Release.gpg')
+            for signed_file in 'Release.gpg', 'InRelease':
+                if os.path.isfile(os.path.join(directory, signed_file)) or gpg_key:
+                    metadata_files.append(signed_file)
             metadata_last_updated = max(os.path.getmtime(os.path.join(directory, fn)) for fn in metadata_files)
         except Exception:
             metadata_last_updated = 0
@@ -219,7 +250,8 @@ def update_repository(directory, release_fields={}, gpg_key=None, cache=None):
         # 2. If we fail to generate one of the files it's better not to have
         #    changed any of them, for the same reason as point one :-)
         logger.info("%s trivial repository %s ..", "Updating" if metadata_last_updated else "Creating", directory)
-        temporary_directory = tempfile.mkdtemp()
+        temporary_directory = tempfile.mkdtemp(prefix='deb-pkg-tools-', suffix='-update-repo-stage')
+        logger.debug("Using temporary directory: %s", temporary_directory)
         try:
             # Generate the `Packages' file.
             logger.debug("Generating file: %s", format_path(os.path.join(directory, 'Packages')))
@@ -248,20 +280,26 @@ def update_repository(directory, release_fields={}, gpg_key=None, cache=None):
             release_listing = execute(command, capture=True, directory=temporary_directory, logger=logger)
             with open(os.path.join(temporary_directory, 'Release'), 'w') as handle:
                 handle.write(release_listing + '\n')
-            # Generate the `Release.gpg' file by signing the `Release' file with GPG?
+            # Generate the `Release.gpg' and `InRelease' files by signing the `Release' file with GPG?
             gpg_key_file = os.path.join(directory, 'Release.gpg')
+            in_release_file = os.path.join(directory, 'InRelease')
             if gpg_key:
-                logger.debug("Generating file: %s", format_path(gpg_key_file))
                 initialize_gnupg()
+                logger.debug("Generating file: %s", format_path(gpg_key_file))
                 command = "{gpg} --armor --sign --detach-sign --output Release.gpg Release"
                 execute(command.format(gpg=gpg_key.gpg_command), directory=temporary_directory, logger=logger)
-            elif os.path.isfile(gpg_key_file):
+                logger.debug("Generating file: %s", format_path(in_release_file))
+                command = "{gpg} --armor --sign --clearsign --output InRelease Release"
+                execute(command.format(gpg=gpg_key.gpg_command), directory=temporary_directory, logger=logger)
+            else:
                 # XXX If 1) no GPG key was provided, 2) apt doesn't require the
                 # repository to be signed and 3) `Release.gpg' exists from a
                 # previous run, this file should be removed so we don't create an
                 # inconsistent repository index (when `Release' is updated but
                 # `Release.gpg' is not updated the signature becomes invalid).
-                os.unlink(gpg_key_file)
+                for stale_file in gpg_key_file, in_release_file:
+                    if os.path.isfile(stale_file):
+                        os.unlink(stale_file)
             # Move the generated files into the repository directory.
             for entry in os.listdir(temporary_directory):
                 shutil.copy(os.path.join(temporary_directory, entry), os.path.join(directory, entry))
@@ -371,11 +409,7 @@ def with_repository(directory, *command, **kw):
         deactivate_repository(directory)
 
 
-# Use a global to cache the answer of apt_supports_trusted_option() so we don't
-# execute `dpkg-query --show' and `dpkg --compare-versions' more than once.
-trusted_option_supported = None
-
-
+@cached
 def apt_supports_trusted_option():
     """
     Figure out whether apt supports the ``[trusted=yes]`` option.
@@ -392,16 +426,13 @@ def apt_supports_trusted_option():
 
     .. _Debian bug #596498: http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=596498
     """
-    global trusted_option_supported
-    if trusted_option_supported is None:
-        try:
-            # Find the installed version of the `apt' package.
-            apt_version = Version(find_installed_version('apt'))
-            # Check if the version is >= 0.8.16 (which includes [trusted=yes] support).
-            trusted_option_supported = (apt_version >= Version('0.8.16~exp3'))
-        except ExternalCommandFailed:
-            trusted_option_supported = False
-    return trusted_option_supported
+    try:
+        # Find the installed version of the `apt' package.
+        apt_version = Version(find_installed_version('apt'))
+        # Check if the version is >= 0.8.16 (which includes [trusted=yes] support).
+        return (apt_version >= Version('0.8.16~exp3'))
+    except ExternalCommandFailed:
+        return False
 
 
 def select_gpg_key(directory):
@@ -412,44 +443,101 @@ def select_gpg_key(directory):
                       repository to sign (a string).
     :returns: A :class:`.GPGKey` object or :data:`None`.
 
-    This function is used by :func:`update_repository()` and
-    :func:`activate_repository()` to select a default GPG key.
+    Used by :func:`update_repository()` and :func:`activate_repository()` to
+    select the GPG key for repository signing based on a configuration file.
 
-    First the following locations are checked for a configuration file:
+    **Configuration file locations:**
+
+    The following locations are checked for a configuration file:
 
     1. ``~/.deb-pkg-tools/repos.ini``
     2. ``/etc/deb-pkg-tools/repos.ini``
 
-    If both files exist the first one is used. Here is an example configuration
-    with an explicit repository/key pair and a default key:
+    If both files exist only the first one is used.
 
-    .. code-block:: ini
+    **Configuration file contents:**
 
-        [default]
-        public-key-file = ~/.deb-pkg-tools/default.pub
-        secret-key-file = ~/.deb-pkg-tools/default.sec
+    The configuration files are in the ``*.ini`` file format (refer to the
+    :mod:`ConfigParser` module for details). Each section in the configuration
+    file defines a signing key.
 
-        [test]
-        public-key-file = ~/.deb-pkg-tools/test.pub
-        secret-key-file = ~/.deb-pkg-tools/test.sec
-        directory = /tmp
+    The ``directory`` option controls to which directory or directories a
+    signing key applies. The value of this option is the pathname of a
+    directory and supports pattern matching using ``?`` and ``*`` (see the
+    :mod:`fnmatch` module for details).
 
-    Hopefully this is self explanatory: If the repository directory is ``/tmp``
-    the 'test' key pair is used, otherwise the 'default' key pair is used. The
-    'directory' field can contain globbing wildcards like ``?`` and ``*``. Of
-    course you're free to put the actual ``*.pub`` and ``*.sec`` files anywhere
-    you like; that's the point of having them be configurable :-)
+    **The default signing key:**
+
+    If a section does not define a ``directory`` option then that section is
+    used as the default signing key for directories that are not otherwise
+    matched (by a ``directory`` option).
+
+    **Compatibility with GnuPG >= 2.1:**
+
+    `GnuPG 2.1 compatibility`_ was implemented in deb-pkg-tools release 5.0
+    which changes how users are expected to select an isolated GPG key pair:
+
+    - Before deb-pkg-tools 5.0 only GnuPG < 2.1 was supported and the
+      configuration used the ``public-key-file`` and ``secret-key-file``
+      options to configure the pathnames of the public key file and
+      the secret key file:
+
+      .. code-block:: ini
+
+         [old-example]
+         public-key-file = ~/.deb-pkg-tools/default-signing-key.pub
+         secret-key-file = ~/.deb-pkg-tools/default-signing-key.sec
+
+    - In deb-pkg-tools 5.0 support for GnuPG >= 2.1 was added which means the
+      public key and secret key files are no longer configured separately,
+      instead a ``key-store`` option is used to point to a directory in the
+      format of ``~/.gnupg`` containing the key pair:
+
+      .. code-block:: ini
+
+         [new-example]
+         key-store = ~/.deb-pkg-tools/default-signing-key/
+
+      Additionally a ``key-id`` option was added to make it possible to select
+      a specific key pair from a GnuPG profile directory.
+
+    **Staying backwards compatible:**
+
+    By specifying all three of the ``public-key-file``, ``secret-key-file`` and
+    ``key-store`` options it is possible to achieve compatibility with all
+    supported GnuPG versions:
+
+    - When GnuPG >= 2.1 is installed the ``key-store`` option will be used.
+
+    - When GnuPG < 2.1 is installed the ``public-key-file`` and
+      ``secret-key-file`` options will be used.
+
+    In this case the caller is responsible for making sure that a suitable key
+    pair is available in both locations (compatible with the appropriate
+    version of GnuPG).
+
+    **Default behavior:**
 
     If no GPG keys are configured but apt requires local repositories to be
-    signed then this function falls back to selecting an automatically
-    generated signing key. The generated public key and secret key are stored
-    in the directory ``~/.deb-pkg-tools``.
+    signed (see :func:`apt_supports_trusted_option()`) then this function falls
+    back to selecting an automatically generated signing key. The generated key
+    pair is stored in the directory ``~/.deb-pkg-tools``.
     """
     # Check if the user has configured one or more GPG keys.
     options = load_config(directory)
-    if 'secret-key-file' in options and 'public-key-file' in options:
-        return GPGKey(secret_key_file=os.path.expanduser(options['secret-key-file']),
-                      public_key_file=os.path.expanduser(options['public-key-file']))
+    mapping = [
+        ('key-id', 'key_id'),
+        ('key-store', 'directory'),
+        ('public-key-file', 'public_key_file'),
+        ('secret-key-file', 'secret_key_file'),
+    ]
+    mapped_options = dict(
+        (property_name, options[option_name])
+        for option_name, property_name in mapping
+        if options.get(option_name)
+    )
+    if mapped_options:
+        return GPGKey(**mapped_options)
     if apt_supports_trusted_option():
         # No GPG key was given and no GPG key was configured, however apt
         # supports the [trusted] option so we'll assume the user doesn't care
@@ -466,10 +554,16 @@ def select_gpg_key(directory):
         # XXX About the choice of `user_config_directory' here vs.
         # `system_config_directory': Since we're generating a private
         # key we shouldn't ever store it in a non-secure location.
-        return GPGKey(name="deb-pkg-tools",
-                      description="Automatic signing key for deb-pkg-tools",
-                      secret_key_file=os.path.join(config.user_config_directory, 'automatic-signing-key.sec'),
-                      public_key_file=os.path.join(config.user_config_directory, 'automatic-signing-key.pub'))
+        return GPGKey(
+            # These options are required in order to generate a key pair.
+            name="deb-pkg-tools",
+            description="Automatic signing key for deb-pkg-tools",
+            # These options are required for compatibility with GnuPG < 2.1.
+            public_key_file=os.path.join(config.user_config_directory, 'automatic-signing-key.pub'),
+            secret_key_file=os.path.join(config.user_config_directory, 'automatic-signing-key.sec'),
+            # This option is required for compatibility with GnuPG >= 2.1.
+            directory=os.path.join(config.user_config_directory, 'automatic-signing-key'),
+        )
 
 
 def load_config(repository):

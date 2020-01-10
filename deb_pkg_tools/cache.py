@@ -1,7 +1,7 @@
 # Debian packaging tools: Caching of package metadata.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: February 1, 2017
+# Last Change: September 13, 2019
 # URL: https://github.com/xolox/python-deb-pkg-tools
 
 """
@@ -77,20 +77,21 @@ import os
 import time
 
 # External dependencies.
-import memcache
 from humanfriendly import Timer, format_timespan, pluralize
+from humanfriendly.decorators import cached
 from six.moves import cPickle as pickle
 
 # Modules included in our package.
 from deb_pkg_tools.utils import makedirs, sha1
 
+CACHE_FORMAT_REVISION = 2
+"""The version number of the cache format (an integer)."""
+
 # Initialize a logger for this module.
 logger = logging.getLogger(__name__)
 
-# Instance of PackageCache, initialized on demand by get_default_cache().
-default_cache_instance = None
 
-
+@cached
 def get_default_cache():
     """
     Load the default package cache stored inside the user's home directory.
@@ -102,11 +103,8 @@ def get_default_cache():
 
     :returns: A :class:`PackageCache` object.
     """
-    global default_cache_instance
-    if default_cache_instance is None:
-        from deb_pkg_tools.config import package_cache_directory
-        default_cache_instance = PackageCache(directory=package_cache_directory)
-    return default_cache_instance
+    from deb_pkg_tools.config import package_cache_directory
+    return PackageCache(directory=package_cache_directory)
 
 
 class PackageCache(object):
@@ -121,8 +119,41 @@ class PackageCache(object):
         """
         self.directory = directory
         self.entries = {}
-        self.memcached = memcache.Client(['127.0.0.1:11211'])
-        self.use_memcached = True
+        self.connect_memcached()
+
+    def __getstate__(self):
+        """
+        Save a :mod:`pickle` compatible :class:`PackageCache` representation.
+
+        The :func:`__getstate__()` and :func:`__setstate__()` methods make
+        :class:`PackageCache` objects compatible with :mod:`multiprocessing`
+        (which uses :mod:`pickle`). This capability is used by
+        :func:`deb_pkg_tools.cli.collect_packages()` to
+        enable concurrent package collection.
+        """
+        # Get what is normally pickled.
+        state = self.__dict__.copy()
+        # Avoid pickling the `entries' and `memcached' attributes.
+        state.pop('entries')
+        state.pop('memcached', None)
+        # Pickle the other attributes.
+        return state
+
+    def __setstate__(self, state):
+        """Load a :mod:`pickle` compatible :class:`PackageCache` representation."""
+        self.__dict__.update(state)
+        self.entries = {}
+        self.connect_memcached()
+
+    def connect_memcached(self):
+        """Initialize a connection to the memcached daemon."""
+        try:
+            module = __import__('memcache')
+            self.memcached = module.Client(['127.0.0.1:11211'])
+        except Exception:
+            self.use_memcached = False
+        else:
+            self.use_memcached = True
 
     def get_entry(self, category, pathname):
         """
@@ -254,14 +285,15 @@ class CacheEntry(object):
         if self.up_to_date(self.in_memory):
             return self.in_memory['value']
         # Check for a value that was previously cached in memcached.
-        try:
-            from_mc = self.cache.memcached.get(self.cache_key)
-            if self.up_to_date(from_mc):
-                # Cache the value in memory.
-                self.in_memory = from_mc
-                return from_mc['value']
-        except Exception:
-            pass
+        if self.cache.use_memcached:
+            try:
+                from_mc = self.cache.memcached.get(self.cache_key)
+                if self.up_to_date(from_mc):
+                    # Cache the value in memory.
+                    self.in_memory = from_mc
+                    return from_mc['value']
+            except Exception:
+                pass
         # Check for a value that was previously cached on the filesystem.
         try:
             with open(self.cache_file, 'rb') as handle:
@@ -282,8 +314,9 @@ class CacheEntry(object):
         """
         # Cache the value in memory.
         self.in_memory = dict(
-            pathname=self.pathname,
             last_modified=self.last_modified,
+            pathname=self.pathname,
+            revision=CACHE_FORMAT_REVISION,
             value=value,
         )
         # Cache the value in memcached.
@@ -320,7 +353,8 @@ class CacheEntry(object):
         """Helper for :func:`get_value()` to validate cached values."""
         return (value and
                 value['pathname'] == self.pathname and
-                value['last_modified'] >= self.last_modified)
+                value['last_modified'] >= self.last_modified and
+                value.get('revision') == CACHE_FORMAT_REVISION)
 
     def write_file(self, filename):
         """Helper for :func:`set_value()` to cache values on the filesystem."""

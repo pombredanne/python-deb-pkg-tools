@@ -1,7 +1,7 @@
 # Debian packaging tools.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: January 31, 2017
+# Last Change: October 24, 2018
 # URL: https://github.com/xolox/python-deb-pkg-tools
 
 """Sphinx documentation configuration for the `deb-pkg-tools` project."""
@@ -32,8 +32,8 @@ source_suffix = '.rst'
 master_doc = 'index'
 
 # General information about the project.
-project = u'deb-pkg-tools'
-copyright = u'2016, Peter Odding'
+project = 'deb-pkg-tools'
+copyright = '2018, Peter Odding'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -65,21 +65,20 @@ autodoc_member_order = 'bysource'
 # The name of the Pygments (syntax highlighting) style to use.
 pygments_style = 'sphinx'
 
-# Refer to the Python standard library.
-# From: http://twistedmatrix.com/trac/ticket/4582.
+# References to external documentation.
 intersphinx_mapping = dict(
     executor=('https://executor.readthedocs.io/en/latest', None),
     humanfriendly=('https://humanfriendly.readthedocs.io/en/latest', None),
     propertymanager=('https://property-manager.readthedocs.io/en/latest', None),
-    python=('https://docs.python.org/2', None),
-    pythonapt=('https://apt.alioth.debian.org/python-apt-doc', None),
+    python2=('https://docs.python.org/2', None),
+    python3=('https://docs.python.org/3', None),
 )
 
 # -- Options for HTML output ---------------------------------------------------
 
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
-html_theme = 'classic'
+html_theme = 'nature'
 
 # Output file base name for HTML help builder.
 htmlhelp_basename = 'debpkgtoolsdoc'
